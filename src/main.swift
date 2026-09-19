@@ -82,6 +82,9 @@ struct Config {
     /// система закончит, и только потом синхронизируемся и продолжаем.
     var wakeSettle: Double = 2.0
 
+    /// Писать в лог каждое событие клавиш яркости — для разбора проблем.
+    var traceKeys = false
+
     /// Перехватывать родные клавиши яркости, чтобы они продолжали работать
     /// выше 100%. Требует разрешения Accessibility: без него буст остаётся
     /// доступен только через `adaptive-brightness boost`.
@@ -164,6 +167,7 @@ struct Config {
         c.wakeSettle      = d("wakeSettle", c.wakeSettle)
         c.maxBoost        = d("maxBoost", c.maxBoost)
         c.nativeKeysBoost = (raw["nativeKeysBoost"] as? NSNumber)?.boolValue ?? c.nativeKeysBoost
+        c.traceKeys       = (raw["traceKeys"] as? NSNumber)?.boolValue ?? c.traceKeys
         c.startupGrace    = d("startupGrace", c.startupGrace)
         c.pauseOnGameMode = (raw["pauseOnGameMode"] as? NSNumber)?.boolValue ?? c.pauseOnGameMode
         c.pauseApps       = (raw["pauseApps"] as? [String]) ?? c.pauseApps
@@ -509,15 +513,65 @@ final class ChordState: @unchecked Sendable {
     /// Аккорд зажат прямо сейчас — значит события по обеим клавишам наши.
     var held: Bool { lock.lock(); defer { lock.unlock() }; return fired }
 
+    /// Зажата хоть одна клавиша яркости. По переходу false→true запоминаем
+    /// яркость: если это окажется началом аккорда, откатывать надо именно
+    /// сюда, а не к тому, куда её успел угнать автоповтор.
+    var anyHeld: Bool { lock.lock(); defer { lock.unlock() }; return upHeld || downHeld }
+
     func takePending() -> Bool {
         lock.lock(); defer { lock.unlock() }
         let p = pending; pending = false; return p
     }
 }
 
+/// Судьба нажатия каждой клавиши: пропустили мы его в систему или проглотили.
+///
+/// Отпускание обязано повторить судьбу нажатия. Если нажатие ушло в систему, а
+/// отпускание проглотить, система не узнает, что клавишу отпустили, и будет
+/// повторять её до упора шкалы. Ровно это и роняло яркость в ноль.
+final class KeyPassState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var swallowedUpKey = false
+    private var swallowedDownKey = false
+
+    func recordDown(up: Bool, swallowed: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if up { swallowedUpKey = swallowed } else { swallowedDownKey = swallowed }
+    }
+
+    func swallowedDown(up: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return up ? swallowedUpKey : swallowedDownKey
+    }
+}
+
+/// Трассировка событий клавиш яркости. Обработчик события должен быть быстрым,
+/// иначе macOS отключит tap, поэтому он только складывает записи сюда, а пишет
+/// их в лог уже контур.
+final class KeyTrace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+    var enabled = false
+
+    func add(_ s: String) {
+        guard enabled else { return }
+        lock.lock()
+        if lines.count < 200 { lines.append(s) }
+        lock.unlock()
+    }
+
+    func drain() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        let l = lines; lines = []; return l
+    }
+}
+
+let keyTrace = KeyTrace()
+
 let tapState = TapState()
 let keyIntent = KeyIntent()
 let chordState = ChordState()
+let keyPassState = KeyPassState()
 
 // Подтип системного события для медиа-клавиш и коды яркости из IOKit.
 private let systemDefinedSubtype: Int16 = 8
@@ -541,18 +595,23 @@ private let brightnessTapCallback: CGEventTapCallBack = { _, type, event, _ in
     let isUp = keyCode == nxKeyBrightnessUp
     let keyDown = ((ns.data1 & 0x0000_FF00) >> 8) == 0x0A
 
-    let wasHeld = chordState.held
     chordState.note(up: isUp, isDown: keyDown, window: 0.4)
-    if chordState.held || wasHeld {
-        // Пока аккорд зажат и до полного отпускания обеих — всё наше.
-        return nil
+
+    // Отпускание всегда повторяет судьбу своего нажатия — иначе система
+    // считает клавишу зажатой и повторяет её до упора.
+    guard keyDown else {
+        let sw = keyPassState.swallowedDown(up: isUp)
+        keyTrace.add("\(isUp ? "ЯРЧЕ " : "ТУСКЛ") ↑  \(sw ? "глотаю" : "пропускаю")  аккорд=\(chordState.held ? "да" : "нет")")
+        return sw ? nil : Unmanaged.passUnretained(event)
     }
 
-    guard tapState.shouldSwallow(up: isUp) else { return Unmanaged.passUnretained(event) }
+    let swallow = chordState.held || tapState.shouldSwallow(up: isUp)
+    keyPassState.recordDown(up: isUp, swallowed: swallow)
+    keyTrace.add("\(isUp ? "ЯРЧЕ " : "ТУСКЛ") ↓  \(swallow ? "глотаю" : "пропускаю")  аккорд=\(chordState.held ? "да" : "нет")")
+    guard swallow else { return Unmanaged.passUnretained(event) }
 
-    // Нажатие считаем один раз, но проглатываем и отпускание: иначе система
-    // получит половину пары и покажет свой HUD.
-    if keyDown { keyIntent.add(isUp ? 1 : -1) }
+    // Шаг буста считаем только если это не аккорд: аккорд про другое.
+    if !chordState.held { keyIntent.add(isUp ? 1 : -1) }
     return nil
 }
 
@@ -1221,6 +1280,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         log("ВНИМАНИЕ: состояние Game Mode недоступно, пауза по нему работать не будет")
     }
     let boost = XDRBoost(display: display)
+    keyTrace.enabled = config.traceKeys
     let keyTap = BrightnessKeyTap()
     if config.nativeKeysBoost && config.maxBoost > 1.0 {
         if !keyTap.isTrusted {
@@ -1234,6 +1294,16 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     var boostTick = 0
     var screenWasUsable = true
     var wakeSettleUntil = Date.distantPast
+    // Снимок на момент начала серии нажатий клавиш яркости. Автоповтор успевает
+    // угнать яркость к упору, пока человек тянется ко второй клавише аккорда,
+    // поэтому откатывать надо сюда, а не к последнему записанному значению.
+    var keysWereHeld = false
+    var preKeys: (brightness: Double, baseline: Double, baselineLuma: Double)? = nil
+    // Одной записи для отката мало: события клавиш, уже стоящие в очереди
+    // системы, долетают после неё и снова уводят яркость. Держим значение,
+    // пока клавиши зажаты, и полсекунды после отпускания.
+    var chordRestore: Double? = nil
+    var chordRestoreUntil = Date.distantPast
     var captureDown = false
     var lastRestart = Date.distantPast
     var paused = false
@@ -1266,6 +1336,26 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
 
         guard let actual = backlight.read(display) else { continue }
         boostTick &+= 1
+
+        if config.traceKeys {
+            for line in keyTrace.drain() { log("  [клавиши] \(line)  яркость=\(pct(actual))") }
+        }
+
+        // Додерживаем откат после аккорда, пока долетают события клавиш.
+        if let v = chordRestore {
+            if Date() < chordRestoreUntil || chordState.anyHeld {
+                if chordState.anyHeld { chordRestoreUntil = Date().addingTimeInterval(0.5) }
+                if !dryRun, abs(actual - v) > 1e-4 { backlight.write(display, v) }
+                state.lastWritten = v
+                current = v
+                velocity = 0
+                moveFrom = nil
+                continue
+            }
+            chordRestore = nil
+            state.lastWritten = v
+            current = v
+        }
 
         // Пока идёт рамп системы, молчим целиком: не пишем яркость и не считаем
         // её правки ручными — иначе baseline уедет на случайную точку рампа.
@@ -1319,16 +1409,35 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 TapStatusChannel.write(ok)
             }
 
+            let heldNow = chordState.anyHeld
+            if heldNow, !keysWereHeld {
+                preKeys = (actual, state.baseline, state.baselineLuma)
+            }
+            keysWereHeld = heldNow
+
             if chordState.takePending() {
                 state.enabled.toggle()
                 state.holdLuma = nil
                 holding = false
                 velocity = 0
                 moveFrom = nil
-                // Первая клавиша аккорда успела уйти в систему и дёрнуть
-                // яркость на шаг — возвращаем как было.
-                if !dryRun { backlight.write(display, state.lastWritten) }
-                current = state.lastWritten
+                // Первая клавиша аккорда успела уйти в систему, и её автоповтор
+                // мог укатить яркость к упору. Возвращаем то, что было до всей
+                // серии нажатий, вместе с прежней точкой отсчёта.
+                let restore = preKeys ?? (actual, state.baseline, state.baselineLuma)
+                log(String(format: "аккорд: яркость была %@, стала %@, откатываю на %@%@",
+                           pct(preKeys?.brightness ?? actual), pct(actual), pct(restore.brightness),
+                           preKeys == nil ? "  [снимка не было!]" : ""))
+                chordRestore = restore.brightness
+                chordRestoreUntil = Date().addingTimeInterval(0.5)
+                if !dryRun { backlight.write(display, restore.brightness) }
+                state.lastWritten = restore.brightness
+                state.baseline = restore.baseline
+                state.baselineLuma = restore.baselineLuma
+                current = restore.brightness
+                preKeys = nil
+                // Шаги, накопленные автоповтором, к бусту отношения не имеют.
+                _ = keyIntent.take()
                 state.save()
                 liveState.set(state)
                 EnableChannel.write(state.enabled)
@@ -1345,8 +1454,12 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                         try? await Task.sleep(nanoseconds: 50_000_000); w += 0.05
                     }
                     if let fresh = sampler.luma { smoothedLuma = fresh }
+                    // Точку отсчёта берём ту, что была до аккорда, но привязываем
+                    // к свежей светлоте: за время простоя контент мог смениться.
                     state.baseline = state.lastWritten
                     state.baselineLuma = smoothedLuma
+                    state.holdLuma = smoothedLuma
+                    holding = true
                     state.save()
                     lastTick = Date()
                 } else {
