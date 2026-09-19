@@ -73,6 +73,20 @@ struct Config {
     /// правил яркость, чтобы демон счёл контент сменившимся и снова взялся вести.
     var resumeLumaDelta: Double = 0.12
 
+    /// Сколько секунд после запуска терпеть отсутствие кадров, прежде чем
+    /// сдаться и выйти.
+    ///
+    /// На входе в систему оконный сервер бывает ещё не готов отдавать кадры,
+    /// и первый снимок падает вовсе не из-за разрешений. Раньше демон в этом
+    /// случае сразу выходил, launchd поднимал его через ThrottleInterval, и так
+    /// по кругу: яркость не управлялась первые полминуты, а в лог сыпались
+    /// строки про невыданное разрешение, которого на деле никто не отзывал.
+    ///
+    /// Обратная сторона: если разрешения действительно нет, демон узнает об
+    /// этом не сразу, а через это окно, и всё время будет висеть в памяти.
+    /// Первую неудачу пишем в лог сразу, чтобы молчания не было.
+    var startupGrace: Double = 90
+
     /// Не трогать яркость, пока macOS держит Game Mode.
     ///
     /// Ловится по `com.apple.system.console_mode_changed` («Console Mode» —
@@ -129,6 +143,7 @@ struct Config {
         c.stopThreshold   = d("stopThreshold", c.stopThreshold)
         c.manualEpsilon   = d("manualEpsilon", c.manualEpsilon)
         c.captureMode     = (raw["captureMode"] as? String) ?? c.captureMode
+        c.startupGrace    = d("startupGrace", c.startupGrace)
         c.pauseOnGameMode = (raw["pauseOnGameMode"] as? NSNumber)?.boolValue ?? c.pauseOnGameMode
         c.pauseApps       = (raw["pauseApps"] as? [String]) ?? c.pauseApps
         c.sampleWidth     = i("sampleWidth", c.sampleWidth)
@@ -640,31 +655,47 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     let sampler: LumaSource = useStream
         ? LiveSampler(width: config.sampleWidth, height: config.sampleHeight, fps: config.captureHz)
         : ShotSampler(width: config.sampleWidth, height: config.sampleHeight, fps: config.captureHz)
-    do {
-        try await sampler.start()
-    } catch {
-        log("ОШИБКА захвата экрана: \(error.localizedDescription)")
-        log("Скорее всего не выдано разрешение Screen Recording. Смотри README, раздел «Разрешения».")
-        exit(2)
+    // Поднимаем съём, не сдаваясь с первой попытки: на входе в систему кадры
+    // начинают идти не сразу. baseline бессмыслен без светлоты, при которой он
+    // задан, поэтому до первого кадра дальше не идём.
+    let startDeadline = Date().addingTimeInterval(max(0, config.startupGrace))
+    var firstLuma: Double? = nil
+    var lastStartError = "кадров нет"
+    var warnedAboutStart = false
+
+    while firstLuma == nil {
+        do {
+            try await sampler.start()
+        } catch {
+            lastStartError = error.localizedDescription
+        }
+
+        var waited = 0.0
+        while waited < 3, firstLuma == nil {
+            if let l = sampler.luma { firstLuma = l; break }
+            if let f = sampler.takeFailure() { lastStartError = f; break }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            waited += 0.05
+        }
+        if firstLuma != nil { break }
+
+        if Date() >= startDeadline {
+            log("ОШИБКА захвата экрана: \(lastStartError)")
+            log("За \(Int(config.startupGrace))с кадр так и не пришёл. Скорее всего не выдано " +
+                "разрешение Screen Recording. Смотри README, раздел «Разрешения».")
+            exit(2)
+        }
+        if !warnedAboutStart {
+            warnedAboutStart = true
+            log("съём пока не отдаёт кадры (\(lastStartError)) — продолжаю пробовать до \(Int(config.startupGrace))с; " +
+                "сразу после входа в систему это нормально")
+        }
+        await sampler.stop()
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
     }
 
-    // Ждём первый кадр: baseline бессмыслен без светлоты, при которой он задан.
-    var smoothedLuma = 0.0
-    var waited = 0.0
-    while true {
-        if let l = sampler.luma { smoothedLuma = l; break }
-        if let f = sampler.takeFailure() {
-            log("ОШИБКА захвата экрана: \(f)")
-            log("Скорее всего не выдано разрешение Screen Recording. Смотри README, раздел «Разрешения».")
-            exit(2)
-        }
-        if waited > 5 {
-            log("ОШИБКА: съём не дал ни одного кадра за 5с")
-            exit(2)
-        }
-        try? await Task.sleep(nanoseconds: 50_000_000)
-        waited += 0.05
-    }
+    var smoothedLuma = firstLuma ?? 0
+    if warnedAboutStart { log("съём пошёл, светлота \(String(format: "%.3f", smoothedLuma))") }
 
     let hadState = State.load() != nil
     var state = State.load() ?? State(baseline: initialBrightness,
@@ -730,6 +761,8 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     if config.pauseOnGameMode && !gameMode.available {
         log("ВНИМАНИЕ: состояние Game Mode недоступно, пауза по нему работать не будет")
     }
+    var captureDown = false
+    var lastRestart = Date.distantPast
     var paused = false
     var pauseBrightness = initialBrightness
     var pauseCheckTick = 0
@@ -815,20 +848,27 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         }
         if paused { continue }
 
-        // Поток мог встать: смена конфигурации дисплея, пробуждение, ошибка.
-        if let f = sampler.takeFailure() {
-            log("съём остановлен (\(f)) — перезапускаю")
-            try? await sampler.start()
+        // Съём мог встать: смена конфигурации дисплея, пробуждение, ошибка.
+        // Перезапуск пробуем не чаще раза в 5с и пишем в лог по смене
+        // состояния, а не каждый такт: если съём не поднимается, иначе выходило
+        // бы по тридцать одинаковых строк в секунду.
+        let failure = sampler.takeFailure()
+        if failure != nil || sampler.silence > 5 {
+            if !captureDown {
+                captureDown = true
+                log("съём встал (\(failure ?? "кадров нет больше 5с")) — перезапускаю")
+            }
+            if Date().timeIntervalSince(lastRestart) > 5 {
+                lastRestart = Date()
+                try? await sampler.start()
+            }
             velocity = 0
             moveFrom = nil
             continue
         }
-        if sampler.silence > 5 {
-            log("съём молчит больше 5с — перезапускаю")
-            try? await sampler.start()
-            velocity = 0
-            moveFrom = nil
-            continue
+        if captureDown {
+            captureDown = false
+            log("съём восстановлен")
         }
 
         if let raw = sampler.luma {

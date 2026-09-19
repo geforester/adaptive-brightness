@@ -18,6 +18,8 @@
   "manualQuietPeriod": 0.6,
   "resumeLumaDelta": 0.12,
 
+  "startupGrace": 90,
+
   "pauseOnGameMode": true,
   "pauseApps": ["com.codeweavers.", "org.ryujinx."],
 
