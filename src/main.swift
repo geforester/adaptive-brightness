@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import CoreGraphics
 import CoreMedia
@@ -72,6 +73,24 @@ struct Config {
     /// правил яркость, чтобы демон счёл контент сменившимся и снова взялся вести.
     var resumeLumaDelta: Double = 0.12
 
+    /// Не трогать яркость, пока macOS держит Game Mode.
+    ///
+    /// Ловится по `com.apple.system.console_mode_changed` («Console Mode» —
+    /// внутреннее имя Game Mode): 0 — выключен, 1 — включён, после выхода из
+    /// игры сам возвращается в 0.
+    ///
+    /// Срабатывает только для игр, которые macOS сама опознала как игры —
+    /// список лежит в `com.apple.GamePolicyAgent`, ключ `installedGames`. Для
+    /// игр под CrossOver, Wine и прочими обёртками Game Mode не включается
+    /// вообще: система видит только обёртку, у которой нет категории
+    /// «игра». Для них есть `pauseApps`.
+    var pauseOnGameMode = true
+
+    /// Не трогать яркость, пока впереди приложение с таким bundle id.
+    /// Сравнение по префиксу, поэтому "com.codeweavers." накрывает все
+    /// CrossOver-игры разом, а "org.ryujinx." — конкретный эмулятор.
+    var pauseApps: [String] = ["com.codeweavers."]
+
     /// Как снимать кадры.
     ///
     /// `shot` — одиночные снимки в отдельной задаче. Постоянной сессии захвата
@@ -110,6 +129,8 @@ struct Config {
         c.stopThreshold   = d("stopThreshold", c.stopThreshold)
         c.manualEpsilon   = d("manualEpsilon", c.manualEpsilon)
         c.captureMode     = (raw["captureMode"] as? String) ?? c.captureMode
+        c.pauseOnGameMode = (raw["pauseOnGameMode"] as? NSNumber)?.boolValue ?? c.pauseOnGameMode
+        c.pauseApps       = (raw["pauseApps"] as? [String]) ?? c.pauseApps
         c.sampleWidth     = i("sampleWidth", c.sampleWidth)
         c.sampleHeight    = i("sampleHeight", c.sampleHeight)
         return c
@@ -256,6 +277,47 @@ final class ScreenSampler: @unchecked Sendable {
         // оценивает «тёмный / светлый» интерфейс.
         return pow(max(0, min(1, meanLinear)), 1.0 / 2.2)
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Когда яркость трогать не надо
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Функции notify(3) в модуль Darwin не экспортированы — объявляем сами.
+@_silgen_name("notify_register_check")
+func notify_register_check(_ name: UnsafePointer<CChar>, _ token: UnsafeMutablePointer<Int32>) -> UInt32
+@_silgen_name("notify_get_state")
+func notify_get_state(_ token: Int32, _ state: UnsafeMutablePointer<UInt64>) -> UInt32
+
+/// Состояние Game Mode через Darwin-уведомление. Замерено: при запуске игры,
+/// которую macOS считает игрой, значение уходит 0 → 1, после выхода само
+/// возвращается в 0. Чтение дешёвое — это разделяемая память, не XPC.
+final class GameModeWatch {
+    private var token: Int32 = -1
+    private let registered: Bool
+
+    init() {
+        var t: Int32 = 0
+        registered = notify_register_check("com.apple.system.console_mode_changed", &t) == 0
+        if registered { token = t }
+    }
+
+    /// false и в случае, когда уведомление недоступно: лучше продолжать вести
+    /// яркость, чем молча замереть навсегда из-за неопознанного состояния.
+    var active: Bool {
+        guard registered else { return false }
+        var v: UInt64 = 0
+        guard notify_get_state(token, &v) == 0 else { return false }
+        return v != 0
+    }
+
+    var available: Bool { registered }
+}
+
+/// Bundle id приложения на переднем плане. NSWorkspace не требует никаких
+/// разрешений — в отличие от AppleScript, которому нужен Automation.
+func frontmostBundleID() -> String? {
+    NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -662,6 +724,17 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     var moveFrom: Double? = nil
     var moveStarted = Date()
 
+    // Пауза на время игры: яркость не трогаем вообще и съём кадров глушим —
+    // он стоит около 20% одного ядра, а игре эти такты нужнее.
+    let gameMode = GameModeWatch()
+    if config.pauseOnGameMode && !gameMode.available {
+        log("ВНИМАНИЕ: состояние Game Mode недоступно, пауза по нему работать не будет")
+    }
+    var paused = false
+    var pauseBrightness = initialBrightness
+    var pauseCheckTick = 0
+    var pauseReason = ""
+
     while true {
         try? await Task.sleep(nanoseconds: UInt64(dtControl * 1_000_000_000))
 
@@ -677,6 +750,70 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             moveFrom = nil
             continue
         }
+
+        guard let actual = backlight.read(display) else { continue }
+
+        // ── Пауза на время игры ──────────────────────────────────────────────
+        // Опрашиваем не каждый такт: для входа в игру и выхода из неё хватает
+        // с запасом, а лишние обращения к NSWorkspace ни к чему.
+        pauseCheckTick += 1
+        if pauseCheckTick >= 5 {
+            pauseCheckTick = 0
+            var reason = ""
+            if config.pauseOnGameMode && gameMode.active {
+                reason = "Game Mode"
+            } else if let front = frontmostBundleID(),
+                      let hit = config.pauseApps.first(where: { !$0.isEmpty && front.hasPrefix($0) }) {
+                reason = "впереди \(front) (совпало с «\(hit)»)"
+            }
+
+            if !reason.isEmpty, !paused {
+                paused = true
+                pauseReason = reason
+                pauseBrightness = actual
+                velocity = 0
+                moveFrom = nil
+                await sampler.stop()
+                log("пауза: \(reason). Яркость оставляю на \(pct(actual)), съём остановлен")
+            } else if reason.isEmpty, paused {
+                paused = false
+                do {
+                    try await sampler.start()
+                } catch {
+                    log("выход из паузы: съём не поднялся (\(error.localizedDescription))")
+                }
+                // Свежий кадр: за время игры прежняя светлота протухла, и
+                // сглаживать от неё означало бы ехать от выдуманной точки.
+                var waitedResume = 0.0
+                while sampler.luma == nil, waitedResume < 3 {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    waitedResume += 0.05
+                }
+                if let fresh = sampler.luma { smoothedLuma = fresh }
+
+                current = actual
+                state.lastWritten = actual
+                holding = false
+                state.holdLuma = nil
+
+                // Если яркость за время игры крутили руками — это новая точка
+                // отсчёта. Если нет, прежний baseline остаётся в силе: иначе
+                // каждая игра незаметно сбивала бы калибровку.
+                if abs(actual - pauseBrightness) > config.manualEpsilon {
+                    state.baseline = actual
+                    state.baselineLuma = smoothedLuma
+                    log("выход из паузы (\(pauseReason)): яркость меняли вручную → новый baseline \(pct(actual))")
+                } else {
+                    log("выход из паузы (\(pauseReason)): веду от прежнего baseline \(pct(state.baseline))")
+                }
+                state.save()
+                liveState.set(state)
+                lastTick = Date()
+                pauseReason = ""
+                continue
+            }
+        }
+        if paused { continue }
 
         // Поток мог встать: смена конфигурации дисплея, пробуждение, ошибка.
         if let f = sampler.takeFailure() {
@@ -697,8 +834,6 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         if let raw = sampler.luma {
             smoothedLuma += (raw - smoothedLuma) * (1 - exp(-dt / max(0.01, config.tauLuma)))
         }
-
-        guard let actual = backlight.read(display) else { continue }
 
         // ── Внешняя правка ───────────────────────────────────────────────────
         // Чтение возвращает записанное бит-в-бит, поэтому любое расхождение —

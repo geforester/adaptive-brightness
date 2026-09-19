@@ -18,6 +18,11 @@
   "manualQuietPeriod": 0.6,
   "resumeLumaDelta": 0.12,
 
+  "pauseOnGameMode": true,
+  "pauseApps": ["com.codeweavers.", "org.ryujinx."],
+
+  "captureMode": "shot",
+
   "sampleWidth": 96,
   "sampleHeight": 62
 }

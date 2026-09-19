@@ -36,11 +36,31 @@ ensure_signing_identity() {
     rm -rf "$tmp"
 }
 
+# Перезапись бинаря под работающим процессом ломает его подпись на лету:
+# macOS отбирает у живой сессии захвата права (ScreenCaptureKit отвечает
+# ошибкой 1004), а следующий запуск какое-то время получает отказы TCC.
+# Поэтому останавливаем демон на время сборки и поднимаем обратно.
+LABEL="com.geforester.adaptive-brightness"
+WAS_RUNNING=0
+if launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1; then
+    WAS_RUNNING=1
+    echo "==> Останавливаю демон на время сборки"
+    launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+    sleep 1
+fi
+restore_daemon() {
+    [ "$WAS_RUNNING" = "1" ] || return 0
+    echo "==> Поднимаю демон обратно"
+    launchctl bootstrap "gui/$UID" "$HOME/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
+}
+trap restore_daemon EXIT
+
 mkdir -p "$APP/Contents/MacOS" "$BIN_DIR"
 
 echo "==> Компиляция"
 swiftc -O \
     -framework ScreenCaptureKit \
+    -framework AppKit \
     -o "$APP/Contents/MacOS/adaptive-brightness" \
     "$ROOT/src/main.swift"
 
