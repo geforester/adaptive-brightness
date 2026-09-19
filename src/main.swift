@@ -184,6 +184,9 @@ struct State {
     var baselineLuma: Double
     /// Последнее значение, которое демон записал сам, — чтобы отличить ручную правку.
     var lastWritten: Double
+    /// Адаптация включена. Выключается аккордом «ярче + тусклее» и переживает
+    /// перезапуск демона: решение принято руками, отменять его молча нельзя.
+    var enabled: Bool = true
     /// Светлота, при которой была ручная правка, пока демон держит паузу.
     /// nil — паузы нет, демон ведёт яркость. Лежит в state, чтобы `status` мог
     /// объяснить, почему яркость не двигается.
@@ -195,6 +198,7 @@ struct State {
             "baselineLuma": baselineLuma,
             "lastWritten": lastWritten,
         ]
+        obj["enabled"] = enabled
         if let h = holdLuma { obj["holdLuma"] = h }
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) else { return }
         try? data.write(to: stateURL, options: .atomic)
@@ -207,7 +211,8 @@ struct State {
               let l = (raw["baselineLuma"] as? NSNumber)?.doubleValue else { return nil }
         let w = (raw["lastWritten"] as? NSNumber)?.doubleValue ?? b
         let h = (raw["holdLuma"] as? NSNumber)?.doubleValue
-        return State(baseline: b, baselineLuma: l, lastWritten: w, holdLuma: h)
+        let en = (raw["enabled"] as? NSNumber)?.boolValue ?? true
+        return State(baseline: b, baselineLuma: l, lastWritten: w, enabled: en, holdLuma: h)
     }
 }
 
@@ -355,6 +360,30 @@ enum TapStatusChannel {
     }
 }
 
+/// Включена ли адаптация. Через файл состояния это делать нельзя: демон держит
+/// его в памяти и затирает своей копией, так что правка снаружи пропала бы.
+let enableNotification = "com.geforester.adaptive-brightness.enabled"
+
+enum EnableChannel {
+    /// nil — никто ещё не сообщал.
+    static func read() -> Bool? {
+        var t: Int32 = 0
+        guard notify_register_check(enableNotification, &t) == 0 else { return nil }
+        var v: UInt64 = 0
+        guard notify_get_state(t, &v) == 0, v > 0 else { return nil }
+        return v == 2      // 1 — выключено, 2 — включено
+    }
+
+    @discardableResult
+    static func write(_ on: Bool) -> Bool {
+        var t: Int32 = 0
+        guard notify_register_check(enableNotification, &t) == 0 else { return false }
+        guard notify_set_state(t, on ? 2 : 1) == 0 else { return false }
+        _ = notify_post(enableNotification)
+        return true
+    }
+}
+
 /// Уровень хранится как целое в тысячных: 1.0 → 1000, 1.35 → 1350.
 enum BoostChannel {
     static func read() -> Double? {
@@ -448,8 +477,47 @@ final class KeyIntent: @unchecked Sendable {
     func take() -> Int { lock.lock(); defer { lock.unlock() }; let p = pending; pending = 0; return p }
 }
 
+/// Аккорд «ярче + тусклее одновременно» — выключатель адаптации.
+///
+/// Клавиши приходят по одной, поэтому аккорд опознаётся только на второй:
+/// первая к этому моменту уже ушла в систему. Зато пока обе зажаты, все
+/// события по ним глотаем, чтобы автоповтор не дёргал яркость.
+final class ChordState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var upHeld = false
+    private var downHeld = false
+    private var upAt = Date.distantPast
+    private var downAt = Date.distantPast
+    private var fired = false
+    private var pending = false
+
+    func note(up: Bool, isDown: Bool, window: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        let now = Date()
+        if isDown {
+            if up { upHeld = true; upAt = now } else { downHeld = true; downAt = now }
+            if upHeld, downHeld, !fired, abs(upAt.timeIntervalSince(downAt)) < window {
+                fired = true
+                pending = true
+            }
+        } else {
+            if up { upHeld = false } else { downHeld = false }
+            if !upHeld, !downHeld { fired = false }
+        }
+    }
+
+    /// Аккорд зажат прямо сейчас — значит события по обеим клавишам наши.
+    var held: Bool { lock.lock(); defer { lock.unlock() }; return fired }
+
+    func takePending() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let p = pending; pending = false; return p
+    }
+}
+
 let tapState = TapState()
 let keyIntent = KeyIntent()
+let chordState = ChordState()
 
 // Подтип системного события для медиа-клавиш и коды яркости из IOKit.
 private let systemDefinedSubtype: Int16 = 8
@@ -471,11 +539,19 @@ private let brightnessTapCallback: CGEventTapCallBack = { _, type, event, _ in
         return Unmanaged.passUnretained(event)
     }
     let isUp = keyCode == nxKeyBrightnessUp
+    let keyDown = ((ns.data1 & 0x0000_FF00) >> 8) == 0x0A
+
+    let wasHeld = chordState.held
+    chordState.note(up: isUp, isDown: keyDown, window: 0.4)
+    if chordState.held || wasHeld {
+        // Пока аккорд зажат и до полного отпускания обеих — всё наше.
+        return nil
+    }
+
     guard tapState.shouldSwallow(up: isUp) else { return Unmanaged.passUnretained(event) }
 
     // Нажатие считаем один раз, но проглатываем и отпускание: иначе система
     // получит половину пары и покажет свой HUD.
-    let keyDown = ((ns.data1 & 0x0000_FF00) >> 8) == 0x0A
     if keyDown { keyIntent.add(isUp ? 1 : -1) }
     return nil
 }
@@ -1082,6 +1158,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     var state = State.load() ?? State(baseline: initialBrightness,
                                       baselineLuma: smoothedLuma,
                                       lastWritten: initialBrightness,
+                                      enabled: true,
                                       holdLuma: nil)
     if !hadState {
         log("Стартовый baseline: \(pct(state.baseline)) при светлоте \(String(format: "%.3f", state.baselineLuma))")
@@ -1091,6 +1168,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     // launchd шлёт SIGTERM при kickstart и bootout. Сохраняем состояние, иначе
     // в файле останется значение с последнего прихода к цели.
     liveState.set(state)
+    EnableChannel.write(state.enabled)
     let signalQueue = DispatchQueue(label: "com.geforester.adaptive-brightness.signal")
     signal(SIGTERM, SIG_IGN)
     let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
@@ -1202,6 +1280,33 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         // ── Яркость выше 100% ────────────────────────────────────────────────
         // Пока буст включён, адаптив молчит: на таких яркостях он не нужен, да
         // и подсветка всё равно прижата к максимуму — регулировать нечем.
+        // Выключатель могли дёрнуть снаружи командой `toggle`.
+        if let want = EnableChannel.read(), want != state.enabled {
+            state.enabled = want
+            state.holdLuma = nil
+            holding = false
+            velocity = 0
+            moveFrom = nil
+            state.save()
+            liveState.set(state)
+            log(state.enabled ? "команда toggle → адаптация ВКЛЮЧЕНА" : "команда toggle → адаптация ВЫКЛЮЧЕНА")
+            if state.enabled {
+                do { try await sampler.start() } catch {}
+                var w = 0.0
+                while sampler.luma == nil, w < 3 { try? await Task.sleep(nanoseconds: 50_000_000); w += 0.05 }
+                if let fresh = sampler.luma { smoothedLuma = fresh }
+                state.baseline = actual
+                state.baselineLuma = smoothedLuma
+                state.lastWritten = actual
+                current = actual
+                state.save()
+                lastTick = Date()
+            } else {
+                await sampler.stop()
+            }
+            continue
+        }
+
         if let want = BoostChannel.read() { desiredBoost = want }
 
         if config.nativeKeysBoost && config.maxBoost > 1.0 {
@@ -1212,6 +1317,42 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             if boostTick % 15 == 0 {
                 let ok = keyTap.ensureRunning()
                 TapStatusChannel.write(ok)
+            }
+
+            if chordState.takePending() {
+                state.enabled.toggle()
+                state.holdLuma = nil
+                holding = false
+                velocity = 0
+                moveFrom = nil
+                // Первая клавиша аккорда успела уйти в систему и дёрнуть
+                // яркость на шаг — возвращаем как было.
+                if !dryRun { backlight.write(display, state.lastWritten) }
+                current = state.lastWritten
+                state.save()
+                liveState.set(state)
+                EnableChannel.write(state.enabled)
+                log(state.enabled
+                    ? "аккорд «ярче+тусклее» → адаптация ВКЛЮЧЕНА"
+                    : "аккорд «ярче+тусклее» → адаптация ВЫКЛЮЧЕНА, яркость оставляю тебе")
+                if state.enabled {
+                    // Светлота за время простоя протухла — берём свежий кадр.
+                    do { try await sampler.start() } catch {
+                        log("после включения съём не поднялся (\(error.localizedDescription))")
+                    }
+                    var w = 0.0
+                    while sampler.luma == nil, w < 3 {
+                        try? await Task.sleep(nanoseconds: 50_000_000); w += 0.05
+                    }
+                    if let fresh = sampler.luma { smoothedLuma = fresh }
+                    state.baseline = state.lastWritten
+                    state.baselineLuma = smoothedLuma
+                    state.save()
+                    lastTick = Date()
+                } else {
+                    await sampler.stop()
+                }
+                continue
             }
 
             let steps = keyIntent.take()
@@ -1272,6 +1413,16 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             if let fresh = sampler.luma { smoothedLuma = fresh }
             lastTick = Date()
             log("буст снят, вернул \(pct(settledBrightness))")
+            continue
+        }
+
+        // Выключено руками — не трогаем яркость вообще. Буст и перехват клавиш
+        // при этом продолжают работать: выключатель про адаптацию, а не про всё.
+        if !state.enabled {
+            current = actual
+            state.lastWritten = actual
+            velocity = 0
+            moveFrom = nil
             continue
         }
 
@@ -1519,6 +1670,10 @@ func runStatus() async {
     if let s = State.load() {
         print("Baseline:         \(pct(s.baseline)) при светлоте \(String(format: "%.3f", s.baselineLuma)) (norm \(String(format: "%.2f", normalizedLuma(s.baselineLuma, config))))")
         print("Демон выставлял:  \(pct(s.lastWritten))")
+        let on = EnableChannel.read() ?? s.enabled
+        if !on {
+            print("Адаптация:        ВЫКЛЮЧЕНА (аккорд «ярче+тусклее» или `toggle`)")
+        }
         if let h = s.holdLuma {
             print("Пауза:            держу после ручной правки, жду смены контента")
             print("                  снимется, когда norm уедет от \(String(format: "%.2f", normalizedLuma(h, config))) больше чем на \(config.resumeLumaDelta)")
@@ -1565,7 +1720,7 @@ func runReset() async {
     }
     do {
         let l = try await ScreenSampler(width: config.sampleWidth, height: config.sampleHeight).luma()
-        State(baseline: actual, baselineLuma: l, lastWritten: actual, holdLuma: nil).save()
+        State(baseline: actual, baselineLuma: l, lastWritten: actual, enabled: true, holdLuma: nil).save()
         print("Baseline сброшен: \(pct(actual)) при светлоте \(String(format: "%.3f", l))")
     } catch {
         print("не удалось снять кадр: \(error.localizedDescription)"); exit(2)
@@ -1582,6 +1737,7 @@ func usage() {
       probe          печатать светлоту экрана раз в секунду (подбор darkPoint/lightPoint)
       status         текущее состояние, baseline и цель
       reset          принять текущую яркость как новый baseline
+      toggle         включить/выключить адаптацию (то же, что аккорд «ярче+тусклее»)
       boost <N>      яркость выше 100% на XDR: 1.35 или 135. boost 1 — выключить
 
     Конфиг: ~/.config/adaptive-brightness/config.json
@@ -1609,6 +1765,16 @@ case "dry-run":
     await runDaemon(dryRun: true, singleShot: false)
 case "probe":
     await runProbe()
+case "toggle":
+    // Тот же выключатель, что и аккорд, — на случай если клавиш под рукой нет.
+    let now = EnableChannel.read() ?? State.load()?.enabled ?? true
+    if EnableChannel.write(!now) {
+        print(!now ? "адаптация включена" : "адаптация выключена")
+        print("(применяет демон; если он не запущен, ничего не произойдёт)")
+    } else {
+        print("не удалось переключить")
+        exit(1)
+    }
 case "boost":
     let v = args.dropFirst().first.flatMap { Double($0) } ?? 1.0
     // Значения принимаем и как 1.35, и как 135 — так удобнее с клавиатуры.
