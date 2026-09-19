@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import MetalKit
 import CoreGraphics
 import CoreMedia
 import CoreVideo
@@ -73,6 +74,10 @@ struct Config {
     /// правил яркость, чтобы демон счёл контент сменившимся и снова взялся вести.
     var resumeLumaDelta: Double = 0.12
 
+    /// Потолок буста на XDR-панели. 1.0 — буст запрещён, 1.6 ≈ «160%».
+    /// Выше запаса EDR смысла поднимать нет: значения всё равно обрежутся.
+    var maxBoost: Double = 1.6
+
     /// Сколько секунд после запуска терпеть отсутствие кадров, прежде чем
     /// сдаться и выйти.
     ///
@@ -143,6 +148,7 @@ struct Config {
         c.stopThreshold   = d("stopThreshold", c.stopThreshold)
         c.manualEpsilon   = d("manualEpsilon", c.manualEpsilon)
         c.captureMode     = (raw["captureMode"] as? String) ?? c.captureMode
+        c.maxBoost        = d("maxBoost", c.maxBoost)
         c.startupGrace    = d("startupGrace", c.startupGrace)
         c.pauseOnGameMode = (raw["pauseOnGameMode"] as? NSNumber)?.boolValue ?? c.pauseOnGameMode
         c.pauseApps       = (raw["pauseApps"] as? [String]) ?? c.pauseApps
@@ -303,6 +309,35 @@ final class ScreenSampler: @unchecked Sendable {
 func notify_register_check(_ name: UnsafePointer<CChar>, _ token: UnsafeMutablePointer<Int32>) -> UInt32
 @_silgen_name("notify_get_state")
 func notify_get_state(_ token: Int32, _ state: UnsafeMutablePointer<UInt64>) -> UInt32
+@_silgen_name("notify_set_state")
+func notify_set_state(_ token: Int32, _ state: UInt64) -> UInt32
+@_silgen_name("notify_post")
+func notify_post(_ name: UnsafePointer<CChar>) -> UInt32
+
+/// Уровень буста передаётся из CLI в демон через Darwin-уведомление: демон
+/// читает его из разделяемой памяти на каждом такте, это дешевле файла и не
+/// требует ни сокета, ни слежения за файловой системой.
+let boostNotification = "com.geforester.adaptive-brightness.boost"
+
+/// Уровень хранится как целое в тысячных: 1.0 → 1000, 1.35 → 1350.
+enum BoostChannel {
+    static func read() -> Double? {
+        var t: Int32 = 0
+        guard notify_register_check(boostNotification, &t) == 0 else { return nil }
+        var v: UInt64 = 0
+        guard notify_get_state(t, &v) == 0, v > 0 else { return nil }
+        return Double(v) / 1000.0
+    }
+
+    @discardableResult
+    static func write(_ level: Double) -> Bool {
+        var t: Int32 = 0
+        guard notify_register_check(boostNotification, &t) == 0 else { return false }
+        guard notify_set_state(t, UInt64((level * 1000).rounded())) == 0 else { return false }
+        _ = notify_post(boostNotification)
+        return true
+    }
+}
 
 /// Состояние Game Mode через Darwin-уведомление. Замерено: при запуске игры,
 /// которую macOS считает игрой, значение уходит 0 → 1, после выхода само
@@ -333,6 +368,180 @@ final class GameModeWatch {
 /// разрешений — в отличие от AppleScript, которому нужен Automation.
 func frontmostBundleID() -> String? {
     NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Яркость выше 100% на XDR-панели
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Крошечное окно с HDR-содержимым. Само по себе ничего не осветляет — его
+/// единственная роль в том, чтобы macOS перевела панель в HDR-режим и открыла
+/// запас яркости над SDR-белым.
+///
+/// Замерено на Liquid Retina XDR: без окна запас 1.2×, с окном выходит на
+/// 2.667× (это 1600 нит против 600) примерно за секунду.
+final class EDRTriggerView: MTKView, MTKViewDelegate {
+    private var queue: MTLCommandQueue?
+
+    init(value: Double) {
+        super.init(frame: CGRect(x: 0, y: 0, width: 1, height: 1),
+                   device: MTLCreateSystemDefaultDevice())
+        autoResizeDrawable = false
+        drawableSize = CGSize(width: 1, height: 1)
+        queue = device?.makeCommandQueue()
+        delegate = self
+        colorPixelFormat = .rgba16Float
+        colorspace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+        // Значение выше 1.0 и есть HDR-содержимое: именно оно включает режим.
+        clearColor = MTLClearColorMake(value, value, value, 1.0)
+        preferredFramesPerSecond = 5
+        if let l = layer as? CAMetalLayer {
+            l.wantsExtendedDynamicRangeContent = true
+            l.isOpaque = false
+            l.pixelFormat = .rgba16Float
+        }
+    }
+
+    required init(coder: NSCoder) { fatalError("не используется") }
+
+    func draw(in view: MTKView) {
+        guard let queue,
+              let descriptor = view.currentRenderPassDescriptor,
+              let drawable = view.currentDrawable,
+              let buffer = queue.makeCommandBuffer(),
+              let encoder = buffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
+        encoder.endEncoding()
+        buffer.present(drawable)
+        buffer.commit()
+    }
+
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+}
+
+/// Буст яркости выше 100%: HDR-режим плюс растяжение таблицы гаммы в
+/// освободившийся запас.
+///
+/// Работает только в паре. Одна гамма без HDR-режима ничего не даст: значения
+/// выше 1.0 просто обрежутся по белому, картинка потеряет света в highlights и
+/// не станет ярче.
+final class XDRBoost {
+    private let display: CGDirectDisplayID
+    private var window: NSWindow?
+
+    /// Исходная таблица гаммы, снятая до вмешательства. Всё, что мы делаем, —
+    /// это умножение её на коэффициент.
+    private var baseRed = [CGGammaValue](repeating: 0, count: 256)
+    private var baseGreen = [CGGammaValue](repeating: 0, count: 256)
+    private var baseBlue = [CGGammaValue](repeating: 0, count: 256)
+    private var haveBase = false
+
+    private(set) var level: Double = 1.0
+
+    init(display: CGDirectDisplayID) { self.display = display }
+
+    var isActive: Bool { level > 1.0001 }
+
+    /// Запас яркости, который система готова дать прямо сейчас. Больше 1.0
+    /// означает, что панель в HDR-режиме.
+    var headroom: Double {
+        let screen = NSScreen.screens.first {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display
+        }
+        return Double(screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0)
+    }
+
+    private func captureBaseTable() -> Bool {
+        var count: UInt32 = 0
+        let rc = CGGetDisplayTransferByTable(display, 256, &baseRed, &baseGreen, &baseBlue, &count)
+        guard rc == .success else {
+            log("не удалось прочитать таблицу гаммы (ошибка \(rc.rawValue))")
+            return false
+        }
+        haveBase = true
+        return true
+    }
+
+    private func writeTable(factor: Double) {
+        guard haveBase else { return }
+        let f = CGGammaValue(factor)
+        var r = baseRed.map { $0 * f }
+        var g = baseGreen.map { $0 * f }
+        var b = baseBlue.map { $0 * f }
+        let rc = CGSetDisplayTransferByTable(display, 256, &r, &g, &b)
+        if rc != .success { log("CGSetDisplayTransferByTable → ошибка \(rc.rawValue)") }
+    }
+
+    private func openTrigger() {
+        guard window == nil else { return }
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
+                         styleMask: [], backing: .buffered, defer: false)
+        w.collectionBehavior = [.stationary, .ignoresCycle, .canJoinAllSpaces]
+        w.level = .screenSaver
+        // Обязательно: созданное программно окно по умолчанию освобождает себя
+        // при close(), и оставшаяся у нас ссылка даёт двойное освобождение —
+        // падение в objc_release при опустошении autorelease pool.
+        w.isReleasedWhenClosed = false
+        w.isOpaque = false
+        w.hasShadow = false
+        w.backgroundColor = .clear
+        w.ignoresMouseEvents = true
+        w.contentView = EDRTriggerView(value: 1.6)
+        if let s = NSScreen.main {
+            w.setFrameOrigin(CGPoint(x: s.frame.origin.x, y: s.frame.origin.y + s.frame.height - 1))
+        }
+        w.orderFrontRegardless()
+        window = w
+    }
+
+    private func closeTrigger() {
+        window?.close()
+        window = nil
+    }
+
+    /// Выставляет уровень. 1.0 — выключено, всё остальное — во столько раз ярче
+    /// обычного максимума.
+    func set(_ newLevel: Double, maxLevel: Double) {
+        let clamped = max(1.0, min(maxLevel, newLevel))
+        if clamped <= 1.0001 {
+            if isActive || window != nil {
+                CGDisplayRestoreColorSyncSettings()
+                closeTrigger()
+                haveBase = false
+                log("буст выключен")
+            }
+            level = 1.0
+            return
+        }
+
+        if !isActive {
+            // Базовую таблицу снимаем до включения: дальше все правки идут от неё.
+            guard captureBaseTable() else { return }
+            openTrigger()
+            log(String(format: "буст включён: %.0f%%, жду HDR-режим", clamped * 100))
+        }
+        level = clamped
+        writeTable(factor: clamped)
+    }
+
+    /// Гамма — общий ресурс: Night Shift, True Tone и смена цветового профиля
+    /// перезаписывают её целиком, и наш множитель молча пропадает. Поэтому
+    /// сверяем хвост таблицы с ожидаемым и при расхождении накладываем заново.
+    func reapplyIfDrifted() {
+        guard isActive, haveBase else { return }
+        var r = [CGGammaValue](repeating: 0, count: 256)
+        var g = r, b = r
+        var count: UInt32 = 0
+        guard CGGetDisplayTransferByTable(display, 256, &r, &g, &b, &count) == .success,
+              let last = r.last, let expected = baseRed.last else { return }
+        let want = expected * CGGammaValue(level)
+        if abs(last - want) > 0.01 {
+            log(String(format: "таблица гаммы уехала (%.3f вместо %.3f) — накладываю буст заново", last, want))
+            writeTable(factor: level)
+        }
+    }
+
+    /// Снять всё и вернуть экран в исходное состояние.
+    func disable() { set(1.0, maxLevel: 1.0) }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -637,6 +846,7 @@ func screenIsUsable(_ display: CGDirectDisplayID) -> Bool {
 // Основной цикл
 // ─────────────────────────────────────────────────────────────────────────────
 
+@MainActor
 func runDaemon(dryRun: Bool, singleShot: Bool) async {
     ensureDirs()
     let config = Config.load()
@@ -761,6 +971,10 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     if config.pauseOnGameMode && !gameMode.available {
         log("ВНИМАНИЕ: состояние Game Mode недоступно, пауза по нему работать не будет")
     }
+    let boost = XDRBoost(display: display)
+    var desiredBoost = 1.0
+    var preBoostBrightness = initialBrightness
+    var boostTick = 0
     var captureDown = false
     var lastRestart = Date.distantPast
     var paused = false
@@ -785,6 +999,60 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         }
 
         guard let actual = backlight.read(display) else { continue }
+
+        // ── Яркость выше 100% ────────────────────────────────────────────────
+        // Пока буст включён, адаптив молчит: на таких яркостях он не нужен, да
+        // и подсветка всё равно прижата к максимуму — регулировать нечем.
+        if let want = BoostChannel.read() { desiredBoost = want }
+
+        if desiredBoost > 1.0001 && config.maxBoost > 1.0 {
+            if !boost.isActive {
+                preBoostBrightness = actual
+                velocity = 0
+                moveFrom = nil
+                await sampler.stop()
+                log("буст запрошен (\(Int(desiredBoost * 100))%), яркость до него \(pct(actual))")
+            }
+            // Подсветку держим в потолке: выше неё добавляет только гамма.
+            if abs(actual - 1.0) > 1e-4, !dryRun {
+                backlight.write(display, 1.0)
+            }
+            state.lastWritten = 1.0
+            boost.set(desiredBoost, maxLevel: config.maxBoost)
+            boostTick += 1
+            if boostTick % 30 == 0 { boost.reapplyIfDrifted() }
+            continue
+        }
+
+        if boost.isActive {
+            boost.disable()
+            // Выход из HDR-режима не мгновенный, и система в процессе может
+            // сама переставить подсветку. Додерживаем нужное значение секунду:
+            // иначе следующий такт прочитает чужую правку как ручную и сменит
+            // baseline на случайное значение.
+            for _ in 0..<20 {
+                if !dryRun { backlight.write(display, preBoostBrightness) }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            let settledBrightness = backlight.read(display) ?? preBoostBrightness
+            state.lastWritten = settledBrightness
+            current = settledBrightness
+            velocity = 0
+            moveFrom = nil
+            // Возвращаемся к прежней яркости и прежнему baseline: буст — это
+            // отдельный режим, а не новая точка отсчёта для адаптива.
+            do { try await sampler.start() } catch {
+                log("после буста съём не поднялся (\(error.localizedDescription))")
+            }
+            var w = 0.0
+            while sampler.luma == nil, w < 3 {
+                try? await Task.sleep(nanoseconds: 50_000_000); w += 0.05
+            }
+            if let fresh = sampler.luma { smoothedLuma = fresh }
+            lastTick = Date()
+            log("буст снят, вернул \(pct(settledBrightness))")
+            continue
+        }
 
         // ── Пауза на время игры ──────────────────────────────────────────────
         // Опрашиваем не каждый такт: для входа в игру и выхода из неё хватает
@@ -1070,6 +1338,7 @@ func usage() {
       probe          печатать светлоту экрана раз в секунду (подбор darkPoint/lightPoint)
       status         текущее состояние, baseline и цель
       reset          принять текущую яркость как новый baseline
+      boost <N>      яркость выше 100% на XDR: 1.35 или 135. boost 1 — выключить
 
     Конфиг: ~/.config/adaptive-brightness/config.json
     Лог:    ~/.local/state/adaptive-brightness/daemon.log
@@ -1082,13 +1351,33 @@ let args = CommandLine.arguments.dropFirst()
 switch args.first ?? "run" {
 case "run":
     logToFile = true
-    await runDaemon(dryRun: false, singleShot: false)
+    // Metal-окну для EDR нужен полноценный runloop AppKit, поэтому демон
+    // теперь приложение-агент. LSUIElement в Info.plist держит его вне дока.
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    Task { @MainActor in
+        await runDaemon(dryRun: false, singleShot: false)
+    }
+    app.run()
 case "once":
     await runDaemon(dryRun: false, singleShot: true)
 case "dry-run":
     await runDaemon(dryRun: true, singleShot: false)
 case "probe":
     await runProbe()
+case "boost":
+    let v = args.dropFirst().first.flatMap { Double($0) } ?? 1.0
+    // Значения принимаем и как 1.35, и как 135 — так удобнее с клавиатуры.
+    let level = v > 10 ? v / 100 : v
+    if BoostChannel.write(level) {
+        print(level <= 1.0001
+              ? "буст выключен"
+              : String(format: "буст запрошен: %.0f%%", level * 100))
+        print("(применяет демон; если он не запущен, ничего не произойдёт)")
+    } else {
+        print("не удалось записать уровень буста")
+        exit(1)
+    }
 case "status":
     await runStatus()
 case "reset":

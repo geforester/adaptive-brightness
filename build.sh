@@ -61,6 +61,7 @@ echo "==> Компиляция"
 swiftc -O \
     -framework ScreenCaptureKit \
     -framework AppKit \
+    -framework MetalKit \
     -o "$APP/Contents/MacOS/adaptive-brightness" \
     "$ROOT/src/main.swift"
 

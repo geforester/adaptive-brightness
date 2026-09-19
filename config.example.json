@@ -18,6 +18,7 @@
   "manualQuietPeriod": 0.6,
   "resumeLumaDelta": 0.12,
 
+  "maxBoost": 1.6,
   "startupGrace": 90,
 
   "pauseOnGameMode": true,
