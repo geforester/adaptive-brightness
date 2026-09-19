@@ -74,6 +74,11 @@ struct Config {
     /// правил яркость, чтобы демон счёл контент сменившимся и снова взялся вести.
     var resumeLumaDelta: Double = 0.12
 
+    /// Перехватывать родные клавиши яркости, чтобы они продолжали работать
+    /// выше 100%. Требует разрешения Accessibility: без него буст остаётся
+    /// доступен только через `adaptive-brightness boost`.
+    var nativeKeysBoost = true
+
     /// Потолок буста на XDR-панели. 1.0 — буст запрещён, 1.6 ≈ «160%».
     /// Выше запаса EDR смысла поднимать нет: значения всё равно обрежутся.
     var maxBoost: Double = 1.6
@@ -149,6 +154,7 @@ struct Config {
         c.manualEpsilon   = d("manualEpsilon", c.manualEpsilon)
         c.captureMode     = (raw["captureMode"] as? String) ?? c.captureMode
         c.maxBoost        = d("maxBoost", c.maxBoost)
+        c.nativeKeysBoost = (raw["nativeKeysBoost"] as? NSNumber)?.boolValue ?? c.nativeKeysBoost
         c.startupGrace    = d("startupGrace", c.startupGrace)
         c.pauseOnGameMode = (raw["pauseOnGameMode"] as? NSNumber)?.boolValue ?? c.pauseOnGameMode
         c.pauseApps       = (raw["pauseApps"] as? [String]) ?? c.pauseApps
@@ -319,6 +325,27 @@ func notify_post(_ name: UnsafePointer<CChar>) -> UInt32
 /// требует ни сокета, ни слежения за файловой системой.
 let boostNotification = "com.geforester.adaptive-brightness.boost"
 
+/// Состояние перехвата клавиш, чтобы `status` показывал положение дел в
+/// демоне. Спрашивать AXIsProcessTrusted() в процессе CLI бессмысленно: права
+/// там принадлежат терминалу, из которого его запустили, а не демону.
+let tapStatusNotification = "com.geforester.adaptive-brightness.keytap"
+
+enum TapStatusChannel {
+    static func read() -> Bool? {
+        var t: Int32 = 0
+        guard notify_register_check(tapStatusNotification, &t) == 0 else { return nil }
+        var v: UInt64 = 0
+        guard notify_get_state(t, &v) == 0 else { return nil }
+        return v == 2      // 1 — выключен, 2 — включён, 0 — демон не сообщал
+    }
+
+    static func write(_ active: Bool) {
+        var t: Int32 = 0
+        guard notify_register_check(tapStatusNotification, &t) == 0 else { return }
+        _ = notify_set_state(t, active ? 2 : 1)
+    }
+}
+
 /// Уровень хранится как целое в тысячных: 1.0 → 1000, 1.35 → 1350.
 enum BoostChannel {
     static func read() -> Double? {
@@ -368,6 +395,141 @@ final class GameModeWatch {
 /// разрешений — в отличие от AppleScript, которому нужен Automation.
 func frontmostBundleID() -> String? {
     NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Перехват родных клавиш яркости
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Что tap'у разрешено проглатывать прямо сейчас. Обновляется контуром на
+/// каждом такте, читается из обработчика события — отсюда и лок.
+final class TapState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var atCeiling = false
+    private var boostActive = false
+    private var disabled = false
+
+    func update(atCeiling: Bool, boostActive: Bool) {
+        lock.lock(); self.atCeiling = atCeiling; self.boostActive = boostActive; lock.unlock()
+    }
+
+    /// Проглатываем только там, где система всё равно ничего полезного не
+    /// сделает: «ярче» на упёртой в потолок подсветке и обе клавиши внутри
+    /// буста. Всё остальное пропускаем — это штатная регулировка и её HUD.
+    func shouldSwallow(up: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if boostActive { return true }
+        return up && atCeiling
+    }
+
+    func markDisabled() { lock.lock(); disabled = true; lock.unlock() }
+    func takeDisabled() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let d = disabled; disabled = false; return d
+    }
+}
+
+/// Накопленные нажатия: обработчик только складывает их сюда, всю работу
+/// делает контур. Держать логику в обработчике нельзя — если он задумается,
+/// macOS отключит tap по таймауту.
+final class KeyIntent: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = 0
+    func add(_ n: Int) { lock.lock(); pending += n; lock.unlock() }
+    func take() -> Int { lock.lock(); defer { lock.unlock() }; let p = pending; pending = 0; return p }
+}
+
+let tapState = TapState()
+let keyIntent = KeyIntent()
+
+// Подтип системного события для медиа-клавиш и коды яркости из IOKit.
+private let systemDefinedSubtype: Int16 = 8
+private let nxKeyBrightnessUp = 2
+private let nxKeyBrightnessDown = 3
+
+private let brightnessTapCallback: CGEventTapCallBack = { _, type, event, _ in
+    // macOS отключает tap, если обработчик не уложился в отведённое время.
+    // Само по себе это не ошибка — надо просто включить его заново.
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        tapState.markDisabled()
+        return nil
+    }
+    guard let ns = NSEvent(cgEvent: event), ns.subtype.rawValue == systemDefinedSubtype else {
+        return Unmanaged.passUnretained(event)
+    }
+    let keyCode = Int((ns.data1 & 0xFFFF_0000) >> 16)
+    guard keyCode == nxKeyBrightnessUp || keyCode == nxKeyBrightnessDown else {
+        return Unmanaged.passUnretained(event)
+    }
+    let isUp = keyCode == nxKeyBrightnessUp
+    guard tapState.shouldSwallow(up: isUp) else { return Unmanaged.passUnretained(event) }
+
+    // Нажатие считаем один раз, но проглатываем и отпускание: иначе система
+    // получит половину пары и покажет свой HUD.
+    let keyDown = ((ns.data1 & 0x0000_FF00) >> 8) == 0x0A
+    if keyDown { keyIntent.add(isUp ? 1 : -1) }
+    return nil
+}
+
+/// Перехват клавиш яркости. Без разрешения Accessibility tap не создаётся —
+/// это не ошибка, просто буст останется доступен только из CLI.
+final class BrightnessKeyTap {
+    private var tap: CFMachPort?
+    private var source: CFRunLoopSource?
+    private var lastAttempt = Date.distantPast
+    private(set) var active = false
+
+    var isTrusted: Bool { AXIsProcessTrusted() }
+
+    func requestPermission() {
+        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
+    }
+
+    /// Пытается поднять tap. Возвращает true, если он живой.
+    @discardableResult
+    func ensureRunning() -> Bool {
+        if active, let tap, CGEvent.tapIsEnabled(tap: tap) { return true }
+
+        if let tap, tapState.takeDisabled() || !CGEvent.tapIsEnabled(tap: tap) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+            if CGEvent.tapIsEnabled(tap: tap) {
+                log("перехват клавиш: tap был отключён системой, включил заново")
+                return true
+            }
+        }
+
+        // Пересоздание пробуем не чаще раза в 30с, чтобы не молотить впустую,
+        // пока разрешение не выдано.
+        guard Date().timeIntervalSince(lastAttempt) > 30 else { return active }
+        lastAttempt = Date()
+
+        guard AXIsProcessTrusted() else {
+            if active { log("перехват клавиш: разрешение Accessibility отозвано") }
+            active = false
+            return false
+        }
+
+        let mask = CGEventMask(1 << NSEvent.EventType.systemDefined.rawValue)
+        guard let newTap = CGEvent.tapCreate(tap: .cgSessionEventTap,
+                                             place: .headInsertEventTap,
+                                             options: .defaultTap,
+                                             eventsOfInterest: mask,
+                                             callback: brightnessTapCallback,
+                                             userInfo: nil) else {
+            log("перехват клавиш: не удалось создать event tap")
+            active = false
+            return false
+        }
+        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, newTap, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+        CGEvent.tapEnable(tap: newTap, enable: true)
+        tap = newTap
+        source = src
+        active = true
+        log("перехват клавиш яркости включён")
+        return true
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -972,6 +1134,14 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         log("ВНИМАНИЕ: состояние Game Mode недоступно, пауза по нему работать не будет")
     }
     let boost = XDRBoost(display: display)
+    let keyTap = BrightnessKeyTap()
+    if config.nativeKeysBoost && config.maxBoost > 1.0 {
+        if !keyTap.isTrusted {
+            log("перехват клавиш яркости требует разрешения Accessibility — запрашиваю")
+            keyTap.requestPermission()
+        }
+        keyTap.ensureRunning()
+    }
     var desiredBoost = 1.0
     var preBoostBrightness = initialBrightness
     var boostTick = 0
@@ -999,11 +1169,35 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         }
 
         guard let actual = backlight.read(display) else { continue }
+        boostTick &+= 1
 
         // ── Яркость выше 100% ────────────────────────────────────────────────
         // Пока буст включён, адаптив молчит: на таких яркостях он не нужен, да
         // и подсветка всё равно прижата к максимуму — регулировать нечем.
         if let want = BoostChannel.read() { desiredBoost = want }
+
+        if config.nativeKeysBoost && config.maxBoost > 1.0 {
+            // Держим tap живым и сообщаем ему, что сейчас можно проглатывать.
+            // Потолком считаем подсветку на максимуме: именно там системные
+            // клавиши перестают что-либо делать и начинается наша зона.
+            tapState.update(atCeiling: actual >= 0.999, boostActive: boost.isActive)
+            if boostTick % 15 == 0 {
+                let ok = keyTap.ensureRunning()
+                TapStatusChannel.write(ok)
+            }
+
+            let steps = keyIntent.take()
+            if steps != 0 {
+                // Шаг 1/16 — тот же, что у системных клавиш, чтобы переход
+                // через 100% не чувствовался ступенькой.
+                let next = max(1.0, min(config.maxBoost, desiredBoost + Double(steps) / 16.0))
+                if abs(next - desiredBoost) > 1e-6 {
+                    desiredBoost = next
+                    BoostChannel.write(desiredBoost)
+                    log(String(format: "клавиши яркости → %.0f%%", desiredBoost * 100))
+                }
+            }
+        }
 
         if desiredBoost > 1.0001 && config.maxBoost > 1.0 {
             if !boost.isActive {
@@ -1019,7 +1213,6 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             }
             state.lastWritten = 1.0
             boost.set(desiredBoost, maxLevel: config.maxBoost)
-            boostTick += 1
             if boostTick % 30 == 0 { boost.reapplyIfDrifted() }
             continue
         }
@@ -1310,6 +1503,21 @@ func runStatus() async {
     print("tauLuma=\(config.tauLuma)s  travelTime=\(config.travelTime)s  resumeLumaDelta=\(config.resumeLumaDelta)")
     print("control=\(Int(config.controlHz))Гц  capture=\(Int(config.captureHz))Гц")
     print("range=[\(pct(config.minBrightness)), \(pct(config.maxBrightness))]")
+    if config.maxBoost > 1.0 {
+        let level = BoostChannel.read() ?? 1.0
+        print("Буст XDR:         \(level > 1.0001 ? String(format: "%.0f%%", level * 100) : "выключен")  (потолок \(Int(config.maxBoost * 100))%)")
+        let tapLine: String
+        if !config.nativeKeysBoost {
+            tapLine = "отключён в конфиге"
+        } else {
+            switch TapStatusChannel.read() {
+            case .some(true):  tapLine = "работает"
+            case .some(false): tapLine = "не поднялся — нужно разрешение Accessibility"
+            case nil:          tapLine = "демон ещё не сообщал (запущен ли он?)"
+            }
+        }
+        print("Перехват клавиш:  \(tapLine)")
+    }
 }
 
 func runReset() async {

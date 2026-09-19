@@ -19,6 +19,7 @@
   "resumeLumaDelta": 0.12,
 
   "maxBoost": 1.6,
+  "nativeKeysBoost": true,
   "startupGrace": 90,
 
   "pauseOnGameMode": true,
