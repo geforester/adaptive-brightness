@@ -1054,7 +1054,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         if Date() >= startDeadline {
             log("ОШИБКА захвата экрана: \(lastStartError)")
             log("За \(Int(config.startupGrace))с кадр так и не пришёл. Скорее всего не выдано " +
-                "разрешение Screen Recording. Смотри README, раздел «Разрешения».")
+                "разрешение Screen Recording. Смотри INTERNALS.md, раздел «Разрешения».")
             exit(2)
         }
         if !warnedAboutStart {
