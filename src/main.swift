@@ -74,6 +74,14 @@ struct Config {
     /// правил яркость, чтобы демон счёл контент сменившимся и снова взялся вести.
     var resumeLumaDelta: Double = 0.12
 
+    /// Сколько не трогать яркость после пробуждения экрана, сек.
+    ///
+    /// macOS сама плавно поднимает подсветку при выходе из сна и после
+    /// разблокировки. Если писать своё значение в это же время, два регулятора
+    /// дерутся за одну ручку, и это видно как быстрое промаргивание. Ждём, пока
+    /// система закончит, и только потом синхронизируемся и продолжаем.
+    var wakeSettle: Double = 2.0
+
     /// Перехватывать родные клавиши яркости, чтобы они продолжали работать
     /// выше 100%. Требует разрешения Accessibility: без него буст остаётся
     /// доступен только через `adaptive-brightness boost`.
@@ -153,6 +161,7 @@ struct Config {
         c.stopThreshold   = d("stopThreshold", c.stopThreshold)
         c.manualEpsilon   = d("manualEpsilon", c.manualEpsilon)
         c.captureMode     = (raw["captureMode"] as? String) ?? c.captureMode
+        c.wakeSettle      = d("wakeSettle", c.wakeSettle)
         c.maxBoost        = d("maxBoost", c.maxBoost)
         c.nativeKeysBoost = (raw["nativeKeysBoost"] as? NSNumber)?.boolValue ?? c.nativeKeysBoost
         c.startupGrace    = d("startupGrace", c.startupGrace)
@@ -1145,6 +1154,8 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     var desiredBoost = 1.0
     var preBoostBrightness = initialBrightness
     var boostTick = 0
+    var screenWasUsable = true
+    var wakeSettleUntil = Date.distantPast
     var captureDown = false
     var lastRestart = Date.distantPast
     var paused = false
@@ -1165,11 +1176,28 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         guard screenIsUsable(display) else {
             velocity = 0
             moveFrom = nil
+            screenWasUsable = false
             continue
+        }
+        if !screenWasUsable {
+            screenWasUsable = true
+            wakeSettleUntil = Date().addingTimeInterval(max(0, config.wakeSettle))
+            log(String(format: "экран проснулся — не трогаю яркость %.1fс, пока система доводит свой рамп",
+                       max(0, config.wakeSettle)))
         }
 
         guard let actual = backlight.read(display) else { continue }
         boostTick &+= 1
+
+        // Пока идёт рамп системы, молчим целиком: не пишем яркость и не считаем
+        // её правки ручными — иначе baseline уедет на случайную точку рампа.
+        if Date() < wakeSettleUntil {
+            current = actual
+            state.lastWritten = actual
+            velocity = 0
+            moveFrom = nil
+            continue
+        }
 
         // ── Яркость выше 100% ────────────────────────────────────────────────
         // Пока буст включён, адаптив молчит: на таких яркостях он не нужен, да
@@ -1333,7 +1361,15 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         }
 
         if let raw = sampler.luma {
-            smoothedLuma += (raw - smoothedLuma) * (1 - exp(-dt / max(0.01, config.tauLuma)))
+            // Сразу после рампа системы сглаживать не от чего: прежняя светлота
+            // относится к докам сна. Берём свежий кадр как есть.
+            if wakeSettleUntil != .distantPast, Date().timeIntervalSince(wakeSettleUntil) < 1 {
+                smoothedLuma = raw
+                wakeSettleUntil = .distantPast
+                lastTick = Date()
+            } else {
+                smoothedLuma += (raw - smoothedLuma) * (1 - exp(-dt / max(0.01, config.tauLuma)))
+            }
         }
 
         // ── Внешняя правка ───────────────────────────────────────────────────

@@ -18,6 +18,7 @@
   "manualQuietPeriod": 0.6,
   "resumeLumaDelta": 0.12,
 
+  "wakeSettle": 2.0,
   "maxBoost": 1.6,
   "nativeKeysBoost": true,
   "startupGrace": 90,
