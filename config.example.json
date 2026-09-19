@@ -1,0 +1,23 @@
+{
+  "controlHz": 30,
+  "captureHz": 10,
+
+  "span": 0.6,
+  "darkPoint": 0.15,
+  "lightPoint": 0.80,
+
+  "minBrightness": 0.15,
+  "maxBrightness": 1.0,
+
+  "tauLuma": 0.6,
+  "travelTime": 0.8,
+
+  "startThreshold": 0.015,
+  "stopThreshold": 0.002,
+  "manualEpsilon": 0.01,
+  "manualQuietPeriod": 0.6,
+  "resumeLumaDelta": 0.12,
+
+  "sampleWidth": 96,
+  "sampleHeight": 62
+}
