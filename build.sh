@@ -10,6 +10,32 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP="$HOME/Applications/Adaptive Brightness.app"
 BIN_DIR="$HOME/.local/bin"
 
+SIGN_ID="Adaptive Brightness Self-Signed"
+
+# Заводит самоподписанный сертификат для подписи, если его ещё нет.
+# Одноразовая операция: дальше он просто лежит в связке ключей.
+ensure_signing_identity() {
+    if security find-identity -p codesigning 2>/dev/null | grep -q "$SIGN_ID"; then
+        return 0
+    fi
+    echo "    сертификата нет — создаю (один раз на машину)"
+    local tmp pw
+    tmp="$(mktemp -d)"
+    pw="adaptive-brightness-import"
+    openssl req -newkey rsa:2048 -nodes -keyout "$tmp/key.pem" -x509 -days 3650 \
+        -out "$tmp/cert.pem" -subj "/CN=$SIGN_ID" \
+        -addext "basicConstraints=critical,CA:false" \
+        -addext "keyUsage=critical,digitalSignature" \
+        -addext "extendedKeyUsage=critical,codeSigning" >/dev/null 2>&1
+    # Security.framework не читает PKCS#12 с дефолтными алгоритмами OpenSSL 3,
+    # а пустой пароль ломает импорт — отсюда и -keypbe, и непустой pass.
+    openssl pkcs12 -export -out "$tmp/id.p12" -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
+        -passout "pass:$pw" -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg SHA1 >/dev/null 2>&1
+    security import "$tmp/id.p12" -k "$HOME/Library/Keychains/login.keychain-db" \
+        -P "$pw" -T /usr/bin/codesign
+    rm -rf "$tmp"
+}
+
 mkdir -p "$APP/Contents/MacOS" "$BIN_DIR"
 
 echo "==> Компиляция"
@@ -49,12 +75,23 @@ cat > "$APP/Contents/Info.plist" <<'PLISTEOF'
 </plist>
 PLISTEOF
 
-# Ad-hoc подпись со стабильным identifier: без неё macOS считает бандл
-# незнакомым после каждой пересборки и сбрасывает выданное разрешение.
+# Подпись стабильным самоподписанным сертификатом.
+#
+# Ad-hoc подпись (`--sign -`) прописывает в designated requirement cdhash
+# бандла, а он меняется при каждой сборке. macOS видит новое приложение и
+# сбрасывает выданное Screen Recording. Со своим сертификатом requirement
+# выглядит как `identifier "..." and certificate leaf = H"..."` и от содержимого
+# бандла не зависит — разрешение переживает пересборки.
 echo "==> Подпись"
-codesign --force --sign - \
-    --identifier com.geforester.adaptive-brightness \
-    "$APP"
+ensure_signing_identity
+if ! codesign --force --sign "$SIGN_ID" \
+        --identifier com.geforester.adaptive-brightness \
+        "$APP" 2>/dev/null; then
+    echo "    ВНИМАНИЕ: подписать своим сертификатом не вышло (связка ключей заперта?)."
+    echo "    Откатываюсь на ad-hoc — сборка будет рабочей, но Screen Recording"
+    echo "    после неё придётся выдать заново через ./reauthorize.sh"
+    codesign --force --sign - --identifier com.geforester.adaptive-brightness "$APP"
+fi
 
 # CLI-обёртка. Симлинк резолвится в бинарь внутри бандла, поэтому команды
 # из терминала работают под тем же разрешением, что и демон.

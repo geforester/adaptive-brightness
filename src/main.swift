@@ -1,5 +1,7 @@
 import Foundation
 import CoreGraphics
+import CoreMedia
+import CoreVideo
 import ScreenCaptureKit
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,6 +72,18 @@ struct Config {
     /// правил яркость, чтобы демон счёл контент сменившимся и снова взялся вести.
     var resumeLumaDelta: Double = 0.12
 
+    /// Как снимать кадры.
+    ///
+    /// `shot` — одиночные снимки в отдельной задаче. Постоянной сессии захвата
+    /// нет, поэтому macOS не показывает индикатор «идёт запись экрана» в
+    /// меню-баре. Каждый снимок стоит ~35 мс независимо от того, менялась ли
+    /// картинка.
+    ///
+    /// `stream` — постоянный SCStream. На статичном экране кадры не приходят
+    /// вовсе, так что съём почти бесплатен, но индикатор записи экрана висит
+    /// всё время работы демона. Скрыть его нельзя: это привилегия системы.
+    var captureMode = "shot"
+
     /// Разрешение кадра для анализа.
     var sampleWidth: Int = 96
     var sampleHeight: Int = 62
@@ -95,6 +109,7 @@ struct Config {
         c.startThreshold  = d("startThreshold", c.startThreshold)
         c.stopThreshold   = d("stopThreshold", c.stopThreshold)
         c.manualEpsilon   = d("manualEpsilon", c.manualEpsilon)
+        c.captureMode     = (raw["captureMode"] as? String) ?? c.captureMode
         c.sampleWidth     = i("sampleWidth", c.sampleWidth)
         c.sampleHeight    = i("sampleHeight", c.sampleHeight)
         return c
@@ -182,7 +197,7 @@ let linearLUT: [Double] = (0...255).map { i -> Double in
     return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
 }
 
-final class ScreenSampler {
+final class ScreenSampler: @unchecked Sendable {
     private let config: SCStreamConfiguration
     private var filter: SCContentFilter?
     private var filterRefreshed = Date.distantPast
@@ -242,6 +257,238 @@ final class ScreenSampler {
         return pow(max(0, min(1, meanLinear)), 1.0 / 2.2)
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Источник светлоты для демона: два режима с одним интерфейсом
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Главное требование к обоим режимам: контур управления не должен блокироваться
+/// на съёме. Раньше захват стоял прямо в цикле, каждый третий такт выходил вдвое
+/// длиннее, и это читалось как биение на 10 Гц.
+protocol LumaSource: AnyObject {
+    /// Последняя посчитанная светлота; nil — кадров ещё не было.
+    var luma: Double? { get }
+    /// Сколько прошло с последнего кадра. Растёт, только если съём встал.
+    var silence: TimeInterval { get }
+    /// Забирает и очищает последнюю ошибку.
+    func takeFailure() -> String?
+    func start() async throws
+    func stop() async
+}
+
+/// Одиночные снимки в отдельной задаче.
+///
+/// Постоянной сессии захвата нет, поэтому macOS не показывает индикатор записи
+/// экрана. Платим тем, что снимок стоит одинаково всегда: `SCStream` на
+/// статичной картинке не присылает ничего, а здесь мы снимаем по расписанию
+/// независимо от того, менялось что-то или нет.
+final class ShotSampler: LumaSource, @unchecked Sendable {
+    private let shooter: ScreenSampler
+    private let interval: TimeInterval
+
+    private let lock = NSLock()
+    private var _luma: Double?
+    private var _lastDelivery = Date.distantPast
+    private var _failure: String?
+
+    private var task: Task<Void, Never>?
+
+    init(width: Int, height: Int, fps: Double) {
+        shooter = ScreenSampler(width: width, height: height)
+        interval = 1.0 / max(0.1, fps)
+    }
+
+    var luma: Double? { lock.lock(); defer { lock.unlock() }; return _luma }
+
+    var silence: TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return Date().timeIntervalSince(_lastDelivery)
+    }
+
+    func takeFailure() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        let f = _failure; _failure = nil; return f
+    }
+
+    private func publish(_ value: Double) {
+        lock.lock(); _luma = value; _lastDelivery = Date(); lock.unlock()
+    }
+
+    private func publish(failure: String) {
+        lock.lock(); _failure = failure; lock.unlock()
+    }
+
+    func start() async throws {
+        await stop()
+        // Первый снимок делаем синхронно: если разрешения нет, демон должен
+        // узнать об этом сразу, а не через пять секунд молчания.
+        publish(try await shooter.luma())
+
+        let shooter = self.shooter
+        let interval = self.interval
+        task = Task.detached(priority: .userInitiated) { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                guard let self else { return }
+                do {
+                    self.publish(try await shooter.luma())
+                } catch {
+                    shooter.invalidate()
+                    self.publish(failure: error.localizedDescription)
+                    return
+                }
+            }
+        }
+    }
+
+    func stop() async {
+        task?.cancel()
+        task = nil
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Непрерывный поток кадров — то, чем пользуется демон
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Одноразовый `SCScreenshotManager.captureImage` стоит ~35 мс на вызов, и он
+/// стоял прямо в контуре управления: каждый третий такт выходил вдвое длиннее
+/// остальных, что читалось как биение на 10 Гц. Поток отдаёт кадры сам, в своей
+/// очереди, а контур только забирает последнее посчитанное значение и не
+/// блокируется никогда.
+///
+/// Вдобавок поток не присылает картинку, когда она не изменилась, — на
+/// статичном экране съём почти ничего не стоит.
+final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    private let width: Int
+    private let height: Int
+    private let fps: Double
+
+    private let lock = NSLock()
+    private var _luma: Double?
+    private var _lastDelivery = Date.distantPast
+    private var _failure: String?
+
+    private var stream: SCStream?
+    private let queue = DispatchQueue(label: "com.geforester.adaptive-brightness.capture",
+                                      qos: .userInitiated)
+
+    init(width: Int, height: Int, fps: Double) {
+        self.width = width
+        self.height = height
+        self.fps = max(1, fps)
+        super.init()
+    }
+
+    /// Последняя посчитанная светлота; nil — кадров ещё не было.
+    var luma: Double? { lock.lock(); defer { lock.unlock() }; return _luma }
+
+    /// Сколько прошло с последнего кадра любого рода. Растёт только если поток
+    /// действительно встал: статичный экран всё равно шлёт кадры со статусом
+    /// «без изменений», и они здесь учитываются.
+    var silence: TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return Date().timeIntervalSince(_lastDelivery)
+    }
+
+    /// Забирает и очищает последнюю ошибку потока.
+    func takeFailure() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        let f = _failure; _failure = nil; return f
+    }
+
+    func start() async throws {
+        await stop()
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() })
+                ?? content.displays.first else {
+            throw NSError(domain: "adaptive-brightness", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "нет доступных дисплеев"])
+        }
+        let cfg = SCStreamConfiguration()
+        cfg.width = width
+        cfg.height = height
+        cfg.showsCursor = false
+        cfg.capturesAudio = false
+        cfg.pixelFormat = kCVPixelFormatType_32BGRA
+        cfg.queueDepth = 3
+        cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps.rounded()))
+
+        let s = SCStream(filter: SCContentFilter(display: display, excludingWindows: []),
+                         configuration: cfg, delegate: self)
+        try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        try await s.startCapture()
+        noteStreamStarted()
+        stream = s
+    }
+
+    /// Синхронная обёртка: NSLock нельзя брать прямо из async-контекста.
+    private func noteStreamStarted() {
+        lock.lock(); _lastDelivery = Date(); _failure = nil; lock.unlock()
+    }
+
+    func stop() async {
+        guard let s = stream else { return }
+        stream = nil
+        try? await s.stopCapture()
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sb.isValid else { return }
+        lock.lock(); _lastDelivery = Date(); lock.unlock()
+
+        // Кадр без изменений приходит пустым: светлоты он не несёт, прежнее
+        // значение остаётся в силе.
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false)
+                as? [[SCStreamFrameInfo: Any]],
+              let rawStatus = attachments.first?[.status] as? Int,
+              SCFrameStatus(rawValue: rawStatus) == .complete,
+              let pixels = sb.imageBuffer else { return }
+
+        let l = LiveSampler.perceivedLuma(pixels)
+        lock.lock(); _luma = l; lock.unlock()
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        lock.lock(); _failure = error.localizedDescription; lock.unlock()
+    }
+
+    /// Та же метрика, что у одноразового сэмплера, но по BGRA-буферу потока.
+    static func perceivedLuma(_ px: CVPixelBuffer) -> Double {
+        CVPixelBufferLockBaseAddress(px, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(px, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(px) else { return 0 }
+        let w = CVPixelBufferGetWidth(px), h = CVPixelBufferGetHeight(px)
+        guard w > 0, h > 0 else { return 0 }
+        let rowBytes = CVPixelBufferGetBytesPerRow(px)
+        let p = base.assumingMemoryBound(to: UInt8.self)
+        var sum = 0.0
+        for y in 0..<h {
+            let row = p + y * rowBytes
+            for x in 0..<w {
+                let i = x * 4                       // BGRA
+                sum += 0.0722 * linearLUT[Int(row[i])]
+                     + 0.7152 * linearLUT[Int(row[i + 1])]
+                     + 0.2126 * linearLUT[Int(row[i + 2])]
+            }
+        }
+        return pow(max(0, min(1, sum / Double(w * h))), 1.0 / 2.2)
+    }
+}
+
+/// Состояние, доступное обработчику SIGTERM. launchd шлёт SIGTERM при kickstart
+/// и bootout, а state.json пишется только по приходу к цели — без сохранения
+/// здесь перезапуск посреди хода оставлял бы в файле устаревший lastWritten, и
+/// на следующем старте демон принимал бы расхождение за ручную правку и замирал
+/// на случайной яркости.
+final class StateBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var state: State?
+    func set(_ s: State) { lock.lock(); state = s; lock.unlock() }
+    func snapshot() -> State? { lock.lock(); defer { lock.unlock() }; return state }
+}
+
+let liveState = StateBox()
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Модель яркости
@@ -327,17 +574,34 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         exit(1)
     }
 
-    let sampler = ScreenSampler(width: config.sampleWidth, height: config.sampleHeight)
-
-    // Первый замер нужен до инициализации состояния: baseline бессмыслен без
-    // светлоты, при которой он был задан.
-    var smoothedLuma: Double
+    let useStream = config.captureMode.lowercased() == "stream"
+    let sampler: LumaSource = useStream
+        ? LiveSampler(width: config.sampleWidth, height: config.sampleHeight, fps: config.captureHz)
+        : ShotSampler(width: config.sampleWidth, height: config.sampleHeight, fps: config.captureHz)
     do {
-        smoothedLuma = try await sampler.luma()
+        try await sampler.start()
     } catch {
         log("ОШИБКА захвата экрана: \(error.localizedDescription)")
         log("Скорее всего не выдано разрешение Screen Recording. Смотри README, раздел «Разрешения».")
         exit(2)
+    }
+
+    // Ждём первый кадр: baseline бессмыслен без светлоты, при которой он задан.
+    var smoothedLuma = 0.0
+    var waited = 0.0
+    while true {
+        if let l = sampler.luma { smoothedLuma = l; break }
+        if let f = sampler.takeFailure() {
+            log("ОШИБКА захвата экрана: \(f)")
+            log("Скорее всего не выдано разрешение Screen Recording. Смотри README, раздел «Разрешения».")
+            exit(2)
+        }
+        if waited > 5 {
+            log("ОШИБКА: съём не дал ни одного кадра за 5с")
+            exit(2)
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        waited += 0.05
     }
 
     let hadState = State.load() != nil
@@ -350,12 +614,24 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         state.save()
     }
 
-    // Шаг контура и коэффициенты сглаживания. Инерция задаётся постоянной
-    // времени, а не долей на такт: так она не зависит от выбранной частоты.
+    // launchd шлёт SIGTERM при kickstart и bootout. Сохраняем состояние, иначе
+    // в файле останется значение с последнего прихода к цели.
+    liveState.set(state)
+    let signalQueue = DispatchQueue(label: "com.geforester.adaptive-brightness.signal")
+    signal(SIGTERM, SIG_IGN)
+    let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
+    termSource.setEventHandler {
+        if !dryRun, let s = liveState.snapshot() { s.save() }
+        log("SIGTERM — состояние сохранено, выхожу")
+        exit(0)
+    }
+    termSource.resume()
+
     let dtControl = 1.0 / max(1, config.controlHz)
-    let captureEvery = max(1, Int((config.controlHz / max(0.1, config.captureHz)).rounded()))
-    let dtCapture = dtControl * Double(captureEvery)
-    let alphaLuma = 1 - exp(-dtCapture / max(0.01, config.tauLuma))
+    // Потолок на шаг времени. После долгой паузы (спящий экран, перегруженная
+    // система) честный dt дал бы один гигантский шаг — это выглядело бы скачком.
+    // Лучше доехать за пару тактов.
+    let maxTick = 0.1
     // Собственная частота пружины. При критическом демпфировании путь пройден
     // на ~98% к моменту omega·t ≈ 6 — отсюда пересчёт из travelTime.
     let omega = 6.0 / max(0.05, config.travelTime)
@@ -365,51 +641,62 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             "ключ игнорируется. Скорость хода теперь задаёт travelTime (сек до прихода), сейчас \(config.travelTime).")
     }
 
-    log("Запуск. control=\(Int(config.controlHz))Гц capture=\(Int(config.captureHz))Гц " +
+    log("Запуск. control=\(Int(config.controlHz))Гц " +
+        "capture=\(Int(config.captureHz))Гц/\(useStream ? "stream" : "shot") " +
         "tauLuma=\(config.tauLuma)s travel=\(config.travelTime)s span=\(config.span) " +
         "dark=\(config.darkPoint) light=\(config.lightPoint) " +
         "range=[\(pct(config.minBrightness)), \(pct(config.maxBrightness))]\(dryRun ? " [DRY RUN]" : "")")
 
-    var tick = 0
     var current = initialBrightness
     var velocity = 0.0
+    var lastTick = Date()
 
     // Пауза после ручной правки: пока контент не сменился заметно, выставленная
     // рукой яркость и есть правильная — лезть туда не за чем.
-    // Паузу переживаем перезапуск: иначе kickstart демона отменял бы решение,
-    // которое ты принял руками.
     var holding = state.holdLuma != nil
     var holdLuma = state.holdLuma ?? smoothedLuma
     var manualPending = false
     var manualAt = Date.distantPast
 
-    // Начало текущего хода — только ради строчки в логе «откуда и за сколько».
+    // Начало текущего хода — ради строчки в логе «откуда и за сколько».
     var moveFrom: Double? = nil
     var moveStarted = Date()
 
     while true {
         try? await Task.sleep(nanoseconds: UInt64(dtControl * 1_000_000_000))
 
+        // Реальный шаг времени, а не предполагаемый. Раньше пружина считала,
+        // что прошло ровно 1/controlHz, и при любом подтормаживании цикла шла
+        // во столько же раз медленнее заявленного.
+        let tickNow = Date()
+        let dt = min(max(tickNow.timeIntervalSince(lastTick), dtControl * 0.25), maxTick)
+        lastTick = tickNow
+
         guard screenIsUsable(display) else {
             velocity = 0
             moveFrom = nil
-            sampler.invalidate()
             continue
         }
 
-        if tick % captureEvery == 0 {
-            do {
-                let raw = try await sampler.luma()
-                smoothedLuma += (raw - smoothedLuma) * alphaLuma
-            } catch {
-                log("захват не удался: \(error.localizedDescription)")
-                sampler.invalidate()
-                velocity = 0
-                moveFrom = nil
-                continue
-            }
+        // Поток мог встать: смена конфигурации дисплея, пробуждение, ошибка.
+        if let f = sampler.takeFailure() {
+            log("съём остановлен (\(f)) — перезапускаю")
+            try? await sampler.start()
+            velocity = 0
+            moveFrom = nil
+            continue
         }
-        tick &+= 1
+        if sampler.silence > 5 {
+            log("съём молчит больше 5с — перезапускаю")
+            try? await sampler.start()
+            velocity = 0
+            moveFrom = nil
+            continue
+        }
+
+        if let raw = sampler.luma {
+            smoothedLuma += (raw - smoothedLuma) * (1 - exp(-dt / max(0.01, config.tauLuma)))
+        }
 
         guard let actual = backlight.read(display) else { continue }
 
@@ -430,6 +717,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             holdLuma = smoothedLuma
             state.holdLuma = smoothedLuma
             state.save()
+            liveState.set(state)
             manualPending = true
             manualAt = Date()
             continue
@@ -460,6 +748,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             holding = false
             state.holdLuma = nil
             if !dryRun { state.save() }
+            liveState.set(state)
             manualPending = false
             log(String(format: "контент сменился (norm %.2f → %.2f) → снова веду",
                        normalizedLuma(holdLuma, config), normalizedLuma(smoothedLuma, config)))
@@ -479,10 +768,10 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         // Критически демпфированная пружина в устойчивой дискретной форме.
         // Перелёта не даёт по построению, а цель можно менять на каждом такте —
         // поэтому смена контента посреди хода подхватывается без разрыва.
-        let x = omega * dtControl
+        let x = omega * dt
         let decay = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x)
         let offset = current - target
-        let temp = (velocity + omega * offset) * dtControl
+        let temp = (velocity + omega * offset) * dt
         velocity = (velocity - omega * temp) * decay
         current = target + (offset + temp) * decay
 
@@ -495,7 +784,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         }
 
         let settled = abs(target - current) < config.stopThreshold
-                   && abs(velocity) * dtControl < config.stopThreshold
+                   && abs(velocity) * dt < config.stopThreshold
         if settled {
             current = target
             velocity = 0
@@ -506,11 +795,13 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         if abs(current - state.lastWritten) > 1e-5 {
             if !dryRun { backlight.write(display, current) }
             state.lastWritten = current
+            liveState.set(state)
         }
 
         if settled, let from = moveFrom {
             if !dryRun { state.save() }
-            log(String(format: "luma=%.3f (norm %.2f)  %@ → %@ за %.1fс%@",
+            liveState.set(state)
+            log(String(format: "luma=%.3f (norm %.2f)  вёл %@ → %@, %.1fс%@",
                        smoothedLuma, normalizedLuma(smoothedLuma, config),
                        pct(from), pct(target), Date().timeIntervalSince(moveStarted),
                        dryRun ? "  [не применено]" : ""))
