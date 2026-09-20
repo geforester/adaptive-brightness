@@ -74,6 +74,20 @@ struct Config {
     /// правил яркость, чтобы демон счёл контент сменившимся и снова взялся вести.
     var resumeLumaDelta: Double = 0.12
 
+    /// Сколько не снимать кадры после последнего события жеста на трекпаде, сек.
+    ///
+    /// Съём во время анимации рвёт кадр вертикальными полосами, а жест —
+    /// единственный сигнал, приходящий до анимации, а не после неё. 0 выключает.
+    var gestureSettle: Double = 0.7
+
+    /// Сколько не снимать кадры и не трогать яркость после смены рабочего
+    /// стола, сек.
+    ///
+    /// Съём во время анимации перехода рвёт кадр вертикальными полосами:
+    /// запрос на захват заставляет оконный сервер собрать внеочередной кадр
+    /// ровно тогда, когда он рисует переход. Ждём, пока анимация закончится.
+    var spaceSettle: Double = 0.8
+
     /// Сколько не трогать яркость после пробуждения экрана, сек.
     ///
     /// macOS сама плавно поднимает подсветку при выходе из сна и после
@@ -84,6 +98,11 @@ struct Config {
 
     /// Писать в лог каждое событие клавиш яркости — для разбора проблем.
     var traceKeys = false
+
+    /// Расширить перехват на жесты и колесо и писать в лог их типы. Нужно,
+    /// чтобы понять, какие события вообще видны от свайпа смены рабочего стола.
+    /// Все они пропускаются насквозь, перехват только наблюдает.
+    var traceEvents = false
 
     /// Перехватывать родные клавиши яркости, чтобы они продолжали работать
     /// выше 100%. Требует разрешения Accessibility: без него буст остаётся
@@ -164,10 +183,13 @@ struct Config {
         c.stopThreshold   = d("stopThreshold", c.stopThreshold)
         c.manualEpsilon   = d("manualEpsilon", c.manualEpsilon)
         c.captureMode     = (raw["captureMode"] as? String) ?? c.captureMode
+        c.gestureSettle   = d("gestureSettle", c.gestureSettle)
+        c.spaceSettle     = d("spaceSettle", c.spaceSettle)
         c.wakeSettle      = d("wakeSettle", c.wakeSettle)
         c.maxBoost        = d("maxBoost", c.maxBoost)
         c.nativeKeysBoost = (raw["nativeKeysBoost"] as? NSNumber)?.boolValue ?? c.nativeKeysBoost
         c.traceKeys       = (raw["traceKeys"] as? NSNumber)?.boolValue ?? c.traceKeys
+        c.traceEvents     = (raw["traceEvents"] as? NSNumber)?.boolValue ?? c.traceEvents
         c.startupGrace    = d("startupGrace", c.startupGrace)
         c.pauseOnGameMode = (raw["pauseOnGameMode"] as? NSNumber)?.boolValue ?? c.pauseOnGameMode
         c.pauseApps       = (raw["pauseApps"] as? [String]) ?? c.pauseApps
@@ -433,6 +455,29 @@ final class GameModeWatch {
     var available: Bool { registered }
 }
 
+/// Номер текущего пространства (рабочего стола) через приватный SkyLight.
+/// Вызов практически бесплатный — замерено 0.001 мс в худшем случае, так что
+/// опрашивать можно каждый такт.
+final class SpaceWatch {
+    private typealias MainConnFn = @convention(c) () -> Int32
+    private typealias ActiveSpaceFn = @convention(c) (Int32) -> UInt64
+
+    private let cid: Int32
+    private let activeSpace: ActiveSpaceFn?
+
+    init() {
+        let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
+        let mc = dlsym(sky, "CGSMainConnectionID").map { unsafeBitCast($0, to: MainConnFn.self) }
+        activeSpace = dlsym(sky, "CGSGetActiveSpace").map { unsafeBitCast($0, to: ActiveSpaceFn.self) }
+        cid = mc?() ?? 0
+    }
+
+    var available: Bool { activeSpace != nil }
+
+    /// 0, если функция недоступна — тогда смена пространства просто не ловится.
+    func current() -> UInt64 { activeSpace?(cid) ?? 0 }
+}
+
 /// Bundle id приложения на переднем плане. NSWorkspace не требует никаких
 /// разрешений — в отличие от AppleScript, которому нужен Automation.
 func frontmostBundleID() -> String? {
@@ -568,6 +613,87 @@ final class KeyTrace: @unchecked Sendable {
 
 let keyTrace = KeyTrace()
 
+/// Наблюдение за типами событий: только для разбора, всё пропускается насквозь.
+final class EventTraceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var on = false
+    func set(_ v: Bool) { lock.lock(); on = v; lock.unlock() }
+    var enabled: Bool { lock.lock(); defer { lock.unlock() }; return on }
+}
+let eventTrace = EventTraceFlag()
+
+/// Момент последнего жеста на трекпаде.
+///
+/// Свайп смены рабочего стола сыплет событиями типа 29 с того мгновения, как
+/// пальцы поехали, — то есть заранее, до анимации. Номер пространства для этого
+/// не годится: он меняется уже в конце перехода, когда полосы нарисованы.
+final class GestureClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last = Date.distantPast
+    func touch() { lock.lock(); last = Date(); lock.unlock() }
+    func secondsSince() -> TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return Date().timeIntervalSince(last)
+    }
+}
+
+let gestureClock = GestureClock()
+
+private let gestureTapCallback: CGEventTapCallBack = { _, type, event, _ in
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        gestureTapDisabled.set(true)
+        return Unmanaged.passUnretained(event)
+    }
+    gestureClock.touch()
+    return Unmanaged.passUnretained(event)
+}
+
+final class BoolFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = false
+    func set(_ x: Bool) { lock.lock(); v = x; lock.unlock() }
+    func take() -> Bool { lock.lock(); defer { lock.unlock() }; let x = v; v = false; return x }
+}
+let gestureTapDisabled = BoolFlag()
+
+/// Перехватчик жестов. Режим только для прослушивания: он физически не может
+/// ничего заблокировать, в отличие от перехвата клавиш, и нужен лишь чтобы
+/// узнать момент начала жеста.
+final class GestureTap {
+    private var tap: CFMachPort?
+    private var lastAttempt = Date.distantPast
+    private(set) var active = false
+
+    @discardableResult
+    func ensureRunning() -> Bool {
+        if let tap, CGEvent.tapIsEnabled(tap: tap), !gestureTapDisabled.take() { return true }
+        if let tap { CGEvent.tapEnable(tap: tap, enable: true); if CGEvent.tapIsEnabled(tap: tap) { return true } }
+
+        guard Date().timeIntervalSince(lastAttempt) > 30 else { return active }
+        lastAttempt = Date()
+        guard AXIsProcessTrusted() else { active = false; return false }
+
+        var mask: CGEventMask = 0
+        for t in [NSEvent.EventType.gesture, .swipe, .magnify, .smartMagnify, .scrollWheel] {
+            mask |= CGEventMask(1 << t.rawValue)
+        }
+        guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                                        options: .listenOnly, eventsOfInterest: mask,
+                                        callback: gestureTapCallback, userInfo: nil) else {
+            log("перехват жестов: не удалось создать event tap")
+            active = false
+            return false
+        }
+        let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, t, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+        CGEvent.tapEnable(tap: t, enable: true)
+        tap = t
+        active = true
+        log("перехват жестов включён — съём глушится на время жестов трекпада")
+        return true
+    }
+}
+
 let tapState = TapState()
 let keyIntent = KeyIntent()
 let chordState = ChordState()
@@ -585,6 +711,12 @@ private let brightnessTapCallback: CGEventTapCallBack = { _, type, event, _ in
         tapState.markDisabled()
         return nil
     }
+    if eventTrace.enabled, type.rawValue != 14 {
+        let sub = NSEvent(cgEvent: event)?.subtype.rawValue
+        keyTrace.add("событие тип=\(type.rawValue)\(sub.map { " подтип=\($0)" } ?? "")")
+        return Unmanaged.passUnretained(event)
+    }
+
     guard let ns = NSEvent(cgEvent: event), ns.subtype.rawValue == systemDefinedSubtype else {
         return Unmanaged.passUnretained(event)
     }
@@ -654,7 +786,12 @@ final class BrightnessKeyTap {
             return false
         }
 
-        let mask = CGEventMask(1 << NSEvent.EventType.systemDefined.rawValue)
+        var mask = CGEventMask(1 << NSEvent.EventType.systemDefined.rawValue)
+        if eventTrace.enabled {
+            for t in [NSEvent.EventType.gesture, .swipe, .scrollWheel, .magnify, .smartMagnify] {
+                mask |= CGEventMask(1 << t.rawValue)
+            }
+        }
         guard let newTap = CGEvent.tapCreate(tap: .cgSessionEventTap,
                                              place: .headInsertEventTap,
                                              options: .defaultTap,
@@ -866,6 +1003,8 @@ protocol LumaSource: AnyObject {
     func takeFailure() -> String?
     func start() async throws
     func stop() async
+    /// Временно не снимать кадры, не разбирая машинерию захвата.
+    func setSuspended(_ on: Bool)
 }
 
 /// Одиночные снимки в отдельной задаче.
@@ -884,6 +1023,10 @@ final class ShotSampler: LumaSource, @unchecked Sendable {
     private var _failure: String?
 
     private var task: Task<Void, Never>?
+    private var _suspended = false
+
+    func setSuspended(_ on: Bool) { lock.lock(); _suspended = on; lock.unlock() }
+    private var suspended: Bool { lock.lock(); defer { lock.unlock() }; return _suspended }
 
     init(width: Int, height: Int, fps: Double) {
         shooter = ScreenSampler(width: width, height: height)
@@ -922,6 +1065,10 @@ final class ShotSampler: LumaSource, @unchecked Sendable {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                 guard let self else { return }
+                // Во время анимации смены рабочего стола съём рвёт кадр:
+                // одиночный скриншот заставляет оконный сервер собрать
+                // внеочередной кадр ровно тогда, когда он рисует переход.
+                if self.suspended { continue }
                 do {
                     self.publish(try await shooter.luma())
                 } catch {
@@ -1018,6 +1165,11 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
     private func noteStreamStarted() {
         lock.lock(); _lastDelivery = Date(); _failure = nil; lock.unlock()
     }
+
+    /// У потока приостановки нет: его пришлось бы останавливать и поднимать
+    /// заново, что дороже самой проблемы. В режиме `stream` полосы на смене
+    /// рабочего стола остаются — это одна из причин, почему он не по умолчанию.
+    func setSuspended(_ on: Bool) {}
 
     func stop() async {
         guard let s = stream else { return }
@@ -1280,7 +1432,8 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         log("ВНИМАНИЕ: состояние Game Mode недоступно, пауза по нему работать не будет")
     }
     let boost = XDRBoost(display: display)
-    keyTrace.enabled = config.traceKeys
+    keyTrace.enabled = config.traceKeys || config.traceEvents
+    eventTrace.set(config.traceEvents)
     let keyTap = BrightnessKeyTap()
     if config.nativeKeysBoost && config.maxBoost > 1.0 {
         if !keyTap.isTrusted {
@@ -1292,6 +1445,18 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     var desiredBoost = 1.0
     var preBoostBrightness = initialBrightness
     var boostTick = 0
+    let gestureTap = GestureTap()
+    if config.gestureSettle > 0 {
+        gestureTap.ensureRunning()
+    }
+    var gestureSuspended = false
+    let spaceWatch = SpaceWatch()
+    if !spaceWatch.available {
+        log("ВНИМАНИЕ: номер рабочего стола недоступен — съём на смене десктопа глушиться не будет")
+    }
+    var lastSpace = spaceWatch.current()
+    var spaceSettleUntil = Date.distantPast
+    var spaceSuspended = false
     var screenWasUsable = true
     var wakeSettleUntil = Date.distantPast
     // Снимок на момент начала серии нажатий клавиш яркости. Автоповтор успевает
@@ -1336,9 +1501,82 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
 
         guard let actual = backlight.read(display) else { continue }
         boostTick &+= 1
+        var frozenByGesture = false
 
-        if config.traceKeys {
-            for line in keyTrace.drain() { log("  [клавиши] \(line)  яркость=\(pct(actual))") }
+        // ── Жест на трекпаде ─────────────────────────────────────────────────
+        // Пока пальцы на трекпаде и полсекунды после — не снимаем кадров.
+        // Это единственный сигнал, приходящий ДО анимации перехода: номер
+        // пространства меняется уже в конце, когда полосы нарисованы.
+        if config.gestureSettle > 0 {
+            if boostTick % 15 == 0 { gestureTap.ensureRunning() }
+            let quiet = gestureClock.secondsSince()
+            if quiet < config.gestureSettle {
+                if !gestureSuspended {
+                    gestureSuspended = true
+                    sampler.setSuspended(true)
+                    velocity = 0
+                    moveFrom = nil
+                }
+                // Раньше здесь был continue — и пока рука лежала на трекпаде,
+                // цикл не доходил ни до выключателя, ни до клавиш, ни до буста.
+                // Глушим только съём и ведение, всё остальное работает.
+                frozenByGesture = true
+            } else if gestureSuspended {
+                gestureSuspended = false
+                sampler.setSuspended(false)
+                // Контент за время жеста наверняка другой — берём свежий кадр
+                // как есть, без сглаживания от протухшего.
+                let before = sampler.luma
+                var w = 0.0
+                while w < 1.5 {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    w += 0.05
+                    if let fresh = sampler.luma, fresh != before { smoothedLuma = fresh; break }
+                }
+                lastTick = Date()
+                continue
+            }
+        }
+
+        // ── Смена рабочего стола ─────────────────────────────────────────────
+        // Пока идёт анимация перехода, не снимаем кадров и не трогаем яркость:
+        // запрос на захват в этот момент рвёт кадр вертикальными полосами.
+        if config.spaceSettle > 0, spaceWatch.available {
+            let now = spaceWatch.current()
+            if now != lastSpace {
+                lastSpace = now
+                spaceSettleUntil = Date().addingTimeInterval(config.spaceSettle)
+                if !spaceSuspended {
+                    spaceSuspended = true
+                    sampler.setSuspended(true)
+                }
+                velocity = 0
+                moveFrom = nil
+            }
+            if spaceSuspended {
+                if Date() < spaceSettleUntil {
+                    current = actual
+                    state.lastWritten = actual
+                    continue
+                }
+                spaceSuspended = false
+                sampler.setSuspended(false)
+                // Светлота за время перехода протухла: контент другой.
+                // Берём первый же свежий кадр как есть, без сглаживания.
+                var w = 0.0
+                let before = sampler.luma
+                while w < 1.5 {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    w += 0.05
+                    if let fresh = sampler.luma, fresh != before { smoothedLuma = fresh; break }
+                }
+                lastTick = Date()
+                continue
+            }
+        }
+
+        if config.traceKeys || config.traceEvents {
+            for line in keyTrace.drain() { log("  [события] \(line)") }
         }
 
         // Додерживаем откат после аккорда, пока долетают события клавиш.
@@ -1526,6 +1764,15 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             if let fresh = sampler.luma { smoothedLuma = fresh }
             lastTick = Date()
             log("буст снят, вернул \(pct(settledBrightness))")
+            continue
+        }
+
+        // Жест на трекпаде: съём заглушен, вести яркость не по чему.
+        if frozenByGesture {
+            current = actual
+            state.lastWritten = actual
+            velocity = 0
+            moveFrom = nil
             continue
         }
 
