@@ -15,7 +15,7 @@
   "startThreshold": 0.015,
   "stopThreshold": 0.002,
   "manualEpsilon": 0.01,
-  "manualQuietPeriod": 0.6,
+  "calibrateEdge": 0.25,
   "keySettle": 0.35,
   "keyStill": 0.2,
   "keySeriesMax": 4.0,

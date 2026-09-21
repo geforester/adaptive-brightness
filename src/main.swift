@@ -78,12 +78,18 @@ struct Config {
     /// правкой. Чтение возвращает записанное бит-в-бит, поэтому порог держим
     /// много ниже шага клавиш яркости (1/16 = 0.0625).
     var manualEpsilon: Double = 0.01
-    /// Тишина после последнего внешнего изменения, после которой серия нажатий
-    /// считается законченной и пишется одной строкой в лог, сек.
-    var manualQuietPeriod: Double = 0.6
     /// Насколько должна уехать нормированная светлота от той, при которой ты
     /// правил яркость, чтобы демон счёл контент сменившимся и снова взялся вести.
     var resumeLumaDelta: Double = 0.12
+
+    /// Ширина «края» шкалы, в долях нормированной светлоты. Правка на краю
+    /// попадает в свою точку — тёмную или светлую; правка в середине точки не
+    /// трогает и действует разово, до смены контента.
+    ///
+    /// Серединой считается всё между `calibrateEdge` и `1 − calibrateEdge`.
+    /// Ноль означал бы, что попасть в точку можно только идеальным
+    /// совпадением, и калибровка не срабатывала бы почти никогда.
+    var calibrateEdge: Double = 0.25
 
     /// Сколько не снимать кадры после последнего события жеста на трекпаде, сек.
     ///
@@ -236,8 +242,8 @@ struct Config {
         c.maxBrightness   = d("maxBrightness", c.maxBrightness)
         c.tauLuma         = d("tauLuma", c.tauLuma)
         c.travelTime      = d("travelTime", c.travelTime)
-        c.manualQuietPeriod = d("manualQuietPeriod", c.manualQuietPeriod)
         c.resumeLumaDelta = d("resumeLumaDelta", c.resumeLumaDelta)
+        c.calibrateEdge   = d("calibrateEdge", c.calibrateEdge)
         if raw["travelTime"] == nil, raw["tauBrightness"] != nil { c.legacyTauBrightness = true }
         c.startThreshold  = d("startThreshold", c.startThreshold)
         c.stopThreshold   = d("stopThreshold", c.stopThreshold)
@@ -271,11 +277,24 @@ struct Config {
 // Состояние: baseline, который задаёт пользователь руками
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Две точки, между которыми живёт яркость.
+///
+/// Обе выставляет человек, руками: на тёмном экране одну, на светлом другую —
+/// и дальше демон только переключается между ними по светлоте контента.
+/// Прежняя модель хранила одну точку и наклон `span` из конфига, который
+/// приходилось высчитывать самому (README так и советовал: «span = комфортная
+/// яркость на светлом / комфортная на тёмном»). Теперь эти две яркости и есть
+/// состояние, а наклон выводится из них.
+///
+/// Заодно исчезает целый класс неприятностей: нормированная светлота зажата в
+/// [0, 1], поэтому яркость никогда не уходит за пределы выставленной пары.
+/// С одной точкой правка на светлом экране тянула за собой весь диапазон,
+/// включая тёмный конец.
 struct State {
-    /// Яркость, которую пользователь выставил руками.
-    var baseline: Double
-    /// Светлота экрана в момент, когда он её выставил.
-    var baselineLuma: Double
+    /// Яркость для тёмного экрана — светлота на уровне `darkPoint` и ниже.
+    var dark: Double
+    /// Яркость для светлого экрана — светлота на уровне `lightPoint` и выше.
+    var light: Double
     /// Последнее значение, которое демон записал сам, — чтобы отличить ручную правку.
     var lastWritten: Double
     /// Адаптация включена. Выключается аккордом «ярче + тусклее» и переживает
@@ -288,8 +307,8 @@ struct State {
 
     func save() {
         var obj: [String: Any] = [
-            "baseline": baseline,
-            "baselineLuma": baselineLuma,
+            "dark": dark,
+            "light": light,
             "lastWritten": lastWritten,
         ]
         obj["enabled"] = enabled
@@ -298,15 +317,30 @@ struct State {
         try? data.write(to: stateURL, options: .atomic)
     }
 
-    static func load() -> State? {
+    static func load(_ c: Config = Config.load()) -> State? {
         guard let data = try? Data(contentsOf: stateURL),
-              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let b = (raw["baseline"] as? NSNumber)?.doubleValue,
-              let l = (raw["baselineLuma"] as? NSNumber)?.doubleValue else { return nil }
-        let w = (raw["lastWritten"] as? NSNumber)?.doubleValue ?? b
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
         let h = (raw["holdLuma"] as? NSNumber)?.doubleValue
         let en = (raw["enabled"] as? NSNumber)?.boolValue ?? true
-        return State(baseline: b, baselineLuma: l, lastWritten: w, enabled: en, holdLuma: h)
+
+        if let d = (raw["dark"] as? NSNumber)?.doubleValue,
+           let l = (raw["light"] as? NSNumber)?.doubleValue {
+            let w = (raw["lastWritten"] as? NSNumber)?.doubleValue ?? d
+            return State(dark: d, light: l, lastWritten: w, enabled: en, holdLuma: h)
+        }
+
+        // Состояние от прежней модели: одна точка плюс наклон из конфига.
+        // Разворачиваем её в пару концов по той же формуле, по которой она
+        // считала цель, — на глаз переход незаметен.
+        guard let b = (raw["baseline"] as? NSNumber)?.doubleValue,
+              let bl = (raw["baselineLuma"] as? NSNumber)?.doubleValue else { return nil }
+        let ref = normalizedLuma(bl, c)
+        let d = b * pow(c.span, -ref)
+        let l = b * pow(c.span, 1 - ref)
+        let w = (raw["lastWritten"] as? NSNumber)?.doubleValue ?? b
+        return State(dark: min(1, max(0, d)), light: min(1, max(0, l)),
+                     lastWritten: w, enabled: en, holdLuma: h)
     }
 }
 
@@ -1514,12 +1548,19 @@ func normalizedLuma(_ luma: Double, _ c: Config) -> Double {
     return max(0, min(1, (luma - c.darkPoint) / span))
 }
 
-/// target = baseline × span^(L_now − L_baseline), зажатый в [min, max].
+/// Яркость между двумя выставленными концами: `dark` на тёмном экране, `light`
+/// на светлом, между ними — плавно по нормированной светлоте.
+///
+/// Интерполяция геометрическая, а не линейная: глаз воспринимает яркость
+/// кратно, и равные шаги в середине шкалы иначе читались бы как рывок.
+/// Формула совпадает с прежней при `span = light / dark`, так что контур,
+/// пружина и пороги остались прежними.
 func targetBrightness(luma: Double, state: State, config c: Config) -> Double {
     let now = normalizedLuma(luma, c)
-    let ref = normalizedLuma(state.baselineLuma, c)
-    let factor = pow(c.span, now - ref)
-    return max(c.minBrightness, min(c.maxBrightness, state.baseline * factor))
+    let dark = max(1e-4, state.dark)
+    let light = max(1e-4, state.light)
+    let target = dark * pow(light / dark, now)
+    return max(c.minBrightness, min(c.maxBrightness, target))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1636,14 +1677,21 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     var smoothedLuma = firstLuma ?? 0
     if warnedAboutStart { log("съём пошёл, светлота \(String(format: "%.3f", smoothedLuma))") }
 
-    let hadState = State.load() != nil
-    var state = State.load() ?? State(baseline: initialBrightness,
-                                      baselineLuma: smoothedLuma,
-                                      lastWritten: initialBrightness,
-                                      enabled: true,
-                                      holdLuma: nil)
+    let hadState = State.load(config) != nil
+    // Первый запуск: обеих точек ещё нет, а спрашивать их у человека до того,
+    // как демон хоть что-то сделал, незачем. Разворачиваем текущую яркость в
+    // пару концов по `span` из конфига — дальше первая же правка на тёмном или
+    // светлом экране заменит свой конец настоящим.
+    var state = State.load(config) ?? {
+        let ref = normalizedLuma(smoothedLuma, config)
+        return State(dark: min(1, max(0, initialBrightness * pow(config.span, -ref))),
+                     light: min(1, max(0, initialBrightness * pow(config.span, 1 - ref))),
+                     lastWritten: initialBrightness,
+                     enabled: true,
+                     holdLuma: nil)
+    }()
     if !hadState {
-        log("Стартовый baseline: \(pct(state.baseline)) при светлоте \(String(format: "%.3f", state.baselineLuma))")
+        log("Стартовые точки: тёмный экран \(pct(state.dark)), светлый \(pct(state.light)) — прикинуты от span, поправь руками")
         state.save()
     }
 
@@ -1689,8 +1737,6 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     // рукой яркость и есть правильная — лезть туда не за чем.
     var holding = state.holdLuma != nil
     var holdLuma = state.holdLuma ?? smoothedLuma
-    var manualPending = false
-    var manualAt = Date.distantPast
 
     // Начало текущего хода — ради строчки в логе «откуда и за сколько».
     var moveFrom: Double? = nil
@@ -1739,7 +1785,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     // угнать яркость к упору, пока человек тянется ко второй клавише аккорда,
     // поэтому откатывать надо сюда, а не к последнему записанному значению.
     var keysWereHeld = false
-    var preKeys: (brightness: Double, baseline: Double, baselineLuma: Double)? = nil
+    var preKeys: (brightness: Double, dark: Double, light: Double)? = nil
     // Одной записи для отката мало: события клавиш, уже стоящие в очереди
     // системы, долетают после неё и снова уводят яркость. Держим значение,
     // пока клавиши зажаты, и полсекунды после отпускания.
@@ -1767,6 +1813,9 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     // Пока догоняет, точка отсчёта дописывается свежей светлотой.
     var lumaSettling = false
     var lumaSettlingUntil = Date.distantPast
+    /// Выставленное рукой значение, которое ждёт, пока светлота устоится и
+    /// станет ясно, в чью зону оно попало.
+    var pendingManual: Double? = nil
 
     // ── Ожидание устоявшейся светлоты ────────────────────────────────────────
     // После перехода (жест, смена стола) светлоту берём не первую попавшуюся, а
@@ -1807,27 +1856,60 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         moveFrom = nil
     }
 
-    /// Принять выставленное рукой значение: ход гасим, значение становится
-    /// точкой отсчёта при текущей светлоте, адаптация уходит в паузу до смены
-    /// контента. Одна дорога для клавиш, Control Center и системного датчика.
+    /// Принять выставленное рукой значение. Ход гасим, значение запоминаем, а
+    /// решение, в какую точку его положить, откладываем: зона (тёмный экран
+    /// или светлый) определяется по светлоте, а сразу после переключения окна
+    /// она ещё едет к настоящей. Одна дорога для клавиш, Control Center и
+    /// системного датчика.
     func acceptManual(_ value: Double) {
         velocity = 0
         current = value
         moveFrom = nil
-        state.baseline = value
-        state.baselineLuma = smoothedLuma
         state.lastWritten = value
         holding = true
         holdLuma = smoothedLuma
         state.holdLuma = smoothedLuma
-        // Светлота могла не устояться — тогда точку отсчёта допишем, когда
-        // сглаженная догонит сырую.
+        pendingManual = value
         lumaSettling = true
         lumaSettlingUntil = Date().addingTimeInterval(max(0, config.lumaSettleMax))
         state.save()
         liveState.set(state)
-        manualPending = true
-        manualAt = Date()
+    }
+
+    /// Положить выставленное значение в ту точку, в чьей зоне мы находимся.
+    ///
+    /// Конец пересчитывается так, чтобы кривая прошла ровно через выставленное
+    /// значение при текущей светлоте: выставил 60% — 60% и останется, а не
+    /// «почти 60, демон чуть подвинет». На краю шкалы это почти тождество, к
+    /// середине пересчёт усиливается — потому середина в точки и не пишется.
+    func calibrate(_ value: Double) {
+        let n = normalizedLuma(smoothedLuma, config)
+        let lo = max(0, min(0.5, config.calibrateEdge))
+        let clampPoint = { (x: Double) in max(config.minBrightness, min(config.maxBrightness, x)) }
+
+        if n <= lo {
+            // value = dark^(1−n) · light^n  ⇒  dark = (value / light^n)^(1/(1−n))
+            let light = max(1e-4, state.light)
+            state.dark = clampPoint(pow(value / pow(light, n), 1 / max(1e-6, 1 - n)))
+            holding = false
+            state.holdLuma = nil
+            log(String(format: "тёмный экран → %@ (светлота %.3f, norm %.2f); светлый остаётся %@",
+                       pct(state.dark), smoothedLuma, n, pct(state.light)))
+        } else if n >= 1 - lo {
+            let dark = max(1e-4, state.dark)
+            state.light = clampPoint(pow(value / pow(dark, 1 - n), 1 / max(1e-6, n)))
+            holding = false
+            state.holdLuma = nil
+            log(String(format: "светлый экран → %@ (светлота %.3f, norm %.2f); тёмный остаётся %@",
+                       pct(state.light), smoothedLuma, n, pct(state.dark)))
+        } else {
+            // Серединка: ни туда ни сюда. Точки не трогаем — держим выставленное
+            // до смены контента, как держали бы любую разовую правку.
+            log(String(format: "правка на %@ при светлоте %.3f (norm %.2f) — это середина, точки не трогаю, держу до смены контента",
+                       pct(value), smoothedLuma, n))
+        }
+        state.save()
+        liveState.set(state)
     }
 
     while true {
@@ -1876,19 +1958,6 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 keysSeriesActual = actual
                 keysSeriesStill = Date()
             }
-        }
-
-        // Серия нажатий — это одна правка, строку пишем по её затиханию.
-        // Печатаем здесь, до всех веток с `continue`: раньше строка стояла в
-        // самом низу такта, и пока шёл жест или пауза, цикл до неё не доходил
-        // — правка появлялась в логе через секунды после того, как случилась,
-        // рядом с чужими событиями. Разбирать такой лог невозможно.
-        if manualPending, Date().timeIntervalSince(manualAt) > config.manualQuietPeriod {
-            manualPending = false
-            log(String(format: "ручная правка → baseline %@ при светлоте %.3f (norm %.2f); держу, пока контент не сменится",
-                       pct(state.baseline), state.baselineLuma,
-                       normalizedLuma(state.baselineLuma, config)))
-            if singleShot { return }
         }
 
         // ── Жест на трекпаде ─────────────────────────────────────────────────
@@ -2015,10 +2084,11 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 var w = 0.0
                 while sampler.luma == nil, w < 3 { try? await Task.sleep(nanoseconds: 50_000_000); w += 0.05 }
                 if let fresh = sampler.luma { smoothedLuma = fresh }
-                state.baseline = actual
-                state.baselineLuma = smoothedLuma
+                // То же, что и при включении аккордом: яркость, выставленная
+                // за время простоя, — это правка, и ей место в своей точке.
                 state.lastWritten = actual
                 current = actual
+                calibrate(actual)
                 state.save()
                 lastTick = Date()
             } else {
@@ -2041,7 +2111,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
 
             let heldNow = chordState.anyHeld
             if heldNow, !keysWereHeld {
-                preKeys = (actual, state.baseline, state.baselineLuma)
+                preKeys = (actual, state.dark, state.light)
             }
             keysWereHeld = heldNow
 
@@ -2055,8 +2125,8 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 chordRestoreUntil = Date().addingTimeInterval(0.3)
                 if !dryRun { backlight.write(display, back.brightness) }
                 state.lastWritten = back.brightness
-                state.baseline = back.baseline
-                state.baselineLuma = back.baselineLuma
+                state.dark = back.dark
+                state.light = back.light
                 current = back.brightness
                 preKeys = nil
                 _ = keyIntent.take()
@@ -2072,7 +2142,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 // Первая клавиша аккорда успела уйти в систему, и её автоповтор
                 // мог укатить яркость к упору. Возвращаем то, что было до всей
                 // серии нажатий, вместе с прежней точкой отсчёта.
-                let restore = preKeys ?? (actual, state.baseline, state.baselineLuma)
+                let restore = preKeys ?? (actual, state.dark, state.light)
                 log(String(format: "аккорд: яркость была %@, стала %@, откатываю на %@%@",
                            pct(preKeys?.brightness ?? actual), pct(actual), pct(restore.brightness),
                            preKeys == nil ? "  [снимка не было!]" : ""))
@@ -2081,8 +2151,8 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 if !dryRun { backlight.write(display, restore.brightness) }
                 keysSeries = false
                 state.lastWritten = restore.brightness
-                state.baseline = restore.baseline
-                state.baselineLuma = restore.baselineLuma
+                state.dark = restore.dark
+                state.light = restore.light
                 current = restore.brightness
                 preKeys = nil
                 // Шаги, накопленные автоповтором, к бусту отношения не имеют.
@@ -2103,12 +2173,14 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                         try? await Task.sleep(nanoseconds: 50_000_000); w += 0.05
                     }
                     if let fresh = sampler.luma { smoothedLuma = fresh }
-                    // Точку отсчёта берём ту, что была до аккорда, но привязываем
-                    // к свежей светлоте: за время простоя контент мог смениться.
-                    state.baseline = state.lastWritten
-                    state.baselineLuma = smoothedLuma
-                    state.holdLuma = smoothedLuma
+                    // Пока адаптация была выключена, яркость крутили руками —
+                    // и это ровно та правка, которую стоит запомнить. Кладём её
+                    // в тот конец, в чьей зоне мы сейчас; если это серединка,
+                    // точки не трогаем и просто держим, пока контент не
+                    // сменится.
                     holding = true
+                    state.holdLuma = smoothedLuma
+                    calibrate(state.lastWritten)
                     state.save()
                     lastTick = Date()
                 } else {
@@ -2252,15 +2324,15 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 holding = false
                 state.holdLuma = nil
 
-                // Если яркость за время игры крутили руками — это новая точка
-                // отсчёта. Если нет, прежний baseline остаётся в силе: иначе
-                // каждая игра незаметно сбивала бы калибровку.
+                // Если яркость за время игры крутили руками — это правка, и
+                // она идёт в свою точку. Если нет, обе точки остаются в силе:
+                // иначе каждая игра незаметно сбивала бы калибровку.
                 if abs(actual - pauseBrightness) > config.manualEpsilon {
-                    state.baseline = actual
-                    state.baselineLuma = smoothedLuma
-                    log("выход из паузы (\(pauseReason)): яркость меняли вручную → новый baseline \(pct(actual))")
+                    log("выход из паузы (\(pauseReason)): яркость меняли вручную")
+                    calibrate(actual)
                 } else {
-                    log("выход из паузы (\(pauseReason)): веду от прежнего baseline \(pct(state.baseline))")
+                    log(String(format: "выход из паузы (%@): веду между %@ и %@",
+                               pauseReason, pct(state.dark), pct(state.light)))
                 }
                 state.save()
                 liveState.set(state)
@@ -2349,16 +2421,16 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         // обратно. Поэтому пока сглаженная догоняет сырую, точку отсчёта
         // дописываем свежей светлотой.
         if lumaSettling {
-            if !holding || Date() >= lumaSettlingUntil {
+            let settled = sampler.luma.map { abs($0 - smoothedLuma) <= config.lumaSettleEps } ?? false
+            let timedOut = Date() >= lumaSettlingUntil
+            if settled || timedOut {
                 lumaSettling = false
-            } else if let raw = sampler.luma, abs(raw - smoothedLuma) > config.lumaSettleEps {
-                state.baselineLuma = smoothedLuma
                 holdLuma = smoothedLuma
-                state.holdLuma = smoothedLuma
-            } else {
-                lumaSettling = false
-                state.save()
-                liveState.set(state)
+                if holding { state.holdLuma = smoothedLuma }
+                if let value = pendingManual {
+                    pendingManual = nil
+                    calibrate(value)
+                }
             }
         }
 
@@ -2414,7 +2486,6 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             state.holdLuma = nil
             if !dryRun { state.save() }
             liveState.set(state)
-            manualPending = false
             log(String(format: "контент сменился (norm %.2f → %.2f) → снова веду",
                        normalizedLuma(holdLuma, config), normalizedLuma(smoothedLuma, config)))
         }
@@ -2518,7 +2589,8 @@ func runStatus() async {
 
     print("Яркость сейчас:   \(pct(actual))")
     if let s = State.load() {
-        print("Baseline:         \(pct(s.baseline)) при светлоте \(String(format: "%.3f", s.baselineLuma)) (norm \(String(format: "%.2f", normalizedLuma(s.baselineLuma, config))))")
+        print("Тёмный экран:     \(pct(s.dark))")
+        print("Светлый экран:    \(pct(s.light))")
         print("Демон выставлял:  \(pct(s.lastWritten))")
         let on = EnableChannel.read() ?? s.enabled
         if !on {
@@ -2540,7 +2612,8 @@ func runStatus() async {
     }
     print("")
     print("Конфиг:           \(FileManager.default.fileExists(atPath: configURL.path) ? configURL.path : "\(configURL.path) (нет, используются дефолты)")")
-    print("span=\(config.span)  dark=\(config.darkPoint)  light=\(config.lightPoint)")
+    print("Границы светлоты: dark=\(config.darkPoint)  light=\(config.lightPoint)")
+    print("                  (span=\(config.span) — только для первого запуска, дальше точки живут в state.json)")
     print("tauLuma=\(config.tauLuma)s  travelTime=\(config.travelTime)s  resumeLumaDelta=\(config.resumeLumaDelta)")
     print("control=\(Int(config.controlHz))Гц  capture=\(Int(config.captureHz))Гц")
     print("range=[\(pct(config.minBrightness)), \(pct(config.maxBrightness))]")
@@ -2570,8 +2643,13 @@ func runReset() async {
     }
     do {
         let l = try await ScreenSampler(width: config.sampleWidth, height: config.sampleHeight).luma()
-        State(baseline: actual, baselineLuma: l, lastWritten: actual, enabled: true, holdLuma: nil).save()
-        print("Baseline сброшен: \(pct(actual)) при светлоте \(String(format: "%.3f", l))")
+        let ref = normalizedLuma(l, config)
+        let st = State(dark: min(1, max(0, actual * pow(config.span, -ref))),
+                       light: min(1, max(0, actual * pow(config.span, 1 - ref))),
+                       lastWritten: actual, enabled: true, holdLuma: nil)
+        st.save()
+        print("Точки сброшены от текущей яркости \(pct(actual)) при светлоте \(String(format: "%.3f", l)):")
+        print("  тёмный экран \(pct(st.dark)), светлый \(pct(st.light))")
     } catch {
         print("не удалось снять кадр: \(error.localizedDescription)"); exit(2)
     }
