@@ -1,5 +1,5 @@
 {
-  "controlHz": 30,
+  "controlHz": 120,
   "captureHz": 10,
 
   "span": 0.6,
@@ -10,17 +10,27 @@
   "maxBrightness": 1.0,
 
   "tauLuma": 0.6,
-  "travelTime": 0.8,
+  "travelTime": 1.1,
 
   "startThreshold": 0.015,
   "stopThreshold": 0.002,
   "manualEpsilon": 0.01,
   "manualQuietPeriod": 0.6,
+  "keySettle": 0.35,
+  "keyStill": 0.2,
+  "keySeriesMax": 4.0,
+  "lumaSettleEps": 0.012,
+  "lumaSettleMax": 2.5,
   "resumeLumaDelta": 0.12,
+
+  "gestureSettle": 0.25,
+  "spaceSettle": 0.8,
+  "spaceGrace": 2.0,
 
   "wakeSettle": 2.0,
   "maxBoost": 1.6,
   "nativeKeysBoost": true,
+  "chordHold": 0.2,
   "startupGrace": 90,
 
   "pauseOnGameMode": true,

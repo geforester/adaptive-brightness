@@ -32,8 +32,19 @@ struct Config {
     /// больше нет, но молча игнорировать чужую настройку нельзя — скажем в логе.
     var legacyTauBrightness = false
 
-    /// Частота контура управления, Гц. Яркость пересчитывается и пишется с этим темпом.
-    var controlHz: Double = 30
+    /// Частота контура управления, Гц. Яркость пересчитывается и пишется с этим
+    /// темпом, и от него напрямую зависит, видно ли ступеньки на ходу.
+    ///
+    /// Замерено: на 30 Гц большой ход идёт шагами по 1.4% яркости — это видно
+    /// глазом. Панель при этом различает уровни мельче 0.1%, то есть предел
+    /// ставило не железо, а наш темп. На 120 планировщик реально выдаёт 83–85
+    /// тактов в секунду (восьмимиллисекундный сон он не держит), и шаг падает
+    /// до 0.3% — ступенек не видно. Цена вопроса мизерная: чтение яркости
+    /// стоит 0.068 мс, запись 0.004 мс, вместе это меньше процента ядра.
+    ///
+    /// Пружина считает по фактическому шагу времени, поэтому недобор частоты
+    /// искажает не траекторию, а только плотность точек на ней.
+    var controlHz: Double = 120
     /// Частота съёма кадра, Гц. Кадр дешевле записи яркости, но composition не бесплатен.
     var captureHz: Double = 10
 
@@ -56,7 +67,7 @@ struct Config {
     /// демпфированная пружина: мягкий старт, максимум скорости в середине,
     /// приход без перелёта. Цель пересчитывается каждый такт, поэтому смена
     /// контента посреди хода подхватывается сразу.
-    var travelTime: Double = 0.8
+    var travelTime: Double = 1.1
 
     /// Из покоя трогаемся, только когда цель разошлась с яркостью больше этого.
     /// Гистерезис против мелкой ряби контента; уже идущий ход не тормозит.
@@ -78,7 +89,14 @@ struct Config {
     ///
     /// Съём во время анимации рвёт кадр вертикальными полосами, а жест —
     /// единственный сигнал, приходящий до анимации, а не после неё. 0 выключает.
-    var gestureSettle: Double = 0.7
+    ///
+    /// Держать здесь всю длину анимации не надо и вредно. Это число — не
+    /// «сколько идёт переход», а «сколько не лезть под руку, пока пальцы
+    /// работают»: конец перехода определяется по самой картинке, ожиданием
+    /// устоявшейся светлоты, и оно же отбраковывает рваные кадры — те не
+    /// устаиваются. Пока здесь стояла вся анимация с запасом, после её конца
+    /// демон ещё почти секунду ничего не делал, и переход ощущался вялым.
+    var gestureSettle: Double = 0.25
 
     /// Сколько не снимать кадры и не трогать яркость после смены рабочего
     /// стола, сек.
@@ -88,6 +106,15 @@ struct Config {
     /// ровно тогда, когда он рисует переход. Ждём, пока анимация закончится.
     var spaceSettle: Double = 0.8
 
+    /// Сколько после перехода, отработанного по жесту, не верить сигналу о
+    /// смене рабочего стола, сек.
+    ///
+    /// Номер стола SkyLight отдаёт с запозданием: анимация давно кончилась,
+    /// светлота устоялась, демон уже ведёт яркость — и только теперь номер
+    /// меняется. Без этой отсрочки переход глушится второй раз, ход рвётся
+    /// пополам, и человек видит паузу ровно в середине.
+    var spaceGrace: Double = 2.0
+
     /// Сколько не трогать яркость после пробуждения экрана, сек.
     ///
     /// macOS сама плавно поднимает подсветку при выходе из сна и после
@@ -95,6 +122,35 @@ struct Config {
     /// дерутся за одну ручку, и это видно как быстрое промаргивание. Ждём, пока
     /// система закончит, и только потом синхронизируемся и продолжаем.
     var wakeSettle: Double = 2.0
+
+    /// Сколько надо продержать обе клавиши яркости вместе, чтобы это
+    /// засчиталось аккордом, сек. Короче — легче задеть случайно.
+    var chordHold: Double = 0.2
+
+    /// Сколько после последнего события клавиш яркости ждать продолжения
+    /// серии, сек. Пока не истекло, серия считается незаконченной.
+    var keySettle: Double = 0.35
+
+    /// Сколько подсветка должна простоять неподвижно, чтобы серия считалась
+    /// доведённой до конца, сек. Ждать только тишины на клавишах мало:
+    /// системный рамп идёт своим темпом и после последнего нажатия.
+    var keyStill: Double = 0.2
+
+    /// Предохранитель: дольше этого серия не длится ни при каких условиях, сек.
+    /// Иначе застрявший рамп или чужая анимация оставили бы демон немым.
+    var keySeriesMax: Double = 4.0
+
+    /// Насколько сглаженная светлота должна сойтись с сырой, чтобы считаться
+    /// установившейся. Пока не сошлась, точка отсчёта после ручной правки
+    /// дописывается: иначе baseline привязывается к светлоте, которой на
+    /// экране не было — она ещё ехала к светлоте нового окна.
+    var lumaSettleEps: Double = 0.012
+
+    /// Предел на это дописывание, сек. Обязателен: на видео сырая светлота
+    /// скачет без остановки, сглаженная не догонит её никогда, и без предела
+    /// демон остался бы в паузе навсегда. При `tauLuma` 0.6 сглаживание
+    /// сходится примерно за 1.8 с, так что предел стоит держать выше.
+    var lumaSettleMax: Double = 2.5
 
     /// Разведка при старте: что демон видит на неактивных столах. Пишет в лог
     /// по строке на стол и выключается сам — это диагностика, не режим работы.
@@ -189,9 +245,16 @@ struct Config {
         c.captureMode     = (raw["captureMode"] as? String) ?? c.captureMode
         c.gestureSettle   = d("gestureSettle", c.gestureSettle)
         c.spaceSettle     = d("spaceSettle", c.spaceSettle)
+        c.spaceGrace      = d("spaceGrace", c.spaceGrace)
         c.wakeSettle      = d("wakeSettle", c.wakeSettle)
         c.maxBoost        = d("maxBoost", c.maxBoost)
         c.nativeKeysBoost = (raw["nativeKeysBoost"] as? NSNumber)?.boolValue ?? c.nativeKeysBoost
+        c.chordHold       = d("chordHold", c.chordHold)
+        c.keySettle       = d("keySettle", c.keySettle)
+        c.keyStill        = d("keyStill", c.keyStill)
+        c.keySeriesMax    = d("keySeriesMax", c.keySeriesMax)
+        c.lumaSettleEps   = d("lumaSettleEps", c.lumaSettleEps)
+        c.lumaSettleMax   = d("lumaSettleMax", c.lumaSettleMax)
         c.probeSpaces     = (raw["probeSpaces"] as? NSNumber)?.boolValue ?? c.probeSpaces
         c.traceKeys       = (raw["traceKeys"] as? NSNumber)?.boolValue ?? c.traceKeys
         c.traceEvents     = (raw["traceEvents"] as? NSNumber)?.boolValue ?? c.traceEvents
@@ -636,8 +699,6 @@ func imageLuma(_ image: CGImage, width: Int = 64, height: Int = 40) -> Double? {
     return pow(max(0, min(1, mean)), 1.0 / 2.2)
 }
 
-
-
 /// Bundle id приложения на переднем плане. NSWorkspace не требует никаких
 /// разрешений — в отличие от AppleScript, которому нужен Automation.
 func frontmostBundleID() -> String? {
@@ -697,43 +758,71 @@ final class ChordState: @unchecked Sendable {
     private var downHeld = false
     private var upAt = Date.distantPast
     private var downAt = Date.distantPast
-    private var fired = false
-    private var pending = false
+
+    /// Момент, когда обе клавиши оказались зажаты. Отсюда отсчитывается
+    /// удержание: аккорд засчитывается не по факту двух нажатий, а только если
+    /// их подержали вместе. Иначе его слишком легко задеть, подкручивая яркость
+    /// вверх-вниз — за сегодня так вышло дважды.
+    private var bothSince: Date? = nil
+    /// Обе побывали зажаты — глотаем события по ним до полного отпускания,
+    /// чтобы автоповтору некуда было разогнаться.
+    private var engaged = false
+    private var matured = false
+    private var pendingCancel = false
 
     func note(up: Bool, isDown: Bool, window: TimeInterval) {
         lock.lock(); defer { lock.unlock() }
         let now = Date()
         if isDown {
-            if up { upHeld = true; upAt = now } else { downHeld = true; downAt = now }
-            if upHeld, downHeld, !fired, abs(upAt.timeIntervalSince(downAt)) < window {
-                fired = true
-                pending = true
+            // Автоповтор шлёт нажатие повторно — момент фиксируем только на
+            // переходе «не зажата → зажата».
+            if up {
+                if !upHeld { upHeld = true; upAt = now }
+            } else {
+                if !downHeld { downHeld = true; downAt = now }
+            }
+            if upHeld, downHeld, bothSince == nil, !matured,
+               abs(upAt.timeIntervalSince(downAt)) < window {
+                bothSince = now
+                engaged = true
             }
         } else {
             if up { upHeld = false } else { downHeld = false }
-            if !upHeld, !downHeld { fired = false }
+            if !upHeld || !downHeld {
+                // Отпустили раньше, чем аккорд созрел: команды не было, это
+                // обычная подкрутка. Просим контур вернуть яркость как было.
+                if bothSince != nil, !matured { pendingCancel = true }
+                bothSince = nil
+            }
+            if !upHeld, !downHeld {
+                engaged = false
+                matured = false
+            }
         }
     }
 
-    /// Аккорд зажат прямо сейчас — значит события по обеим клавишам наши.
-    var held: Bool { lock.lock(); defer { lock.unlock() }; return fired }
+    /// Обе побывали зажаты и ещё не отпущены до конца — события наши.
+    var held: Bool { lock.lock(); defer { lock.unlock() }; return engaged }
 
-    /// Зажата хоть одна клавиша яркости. По переходу false→true запоминаем
-    /// яркость: если это окажется началом аккорда, откатывать надо именно
-    /// сюда, а не к тому, куда её успел угнать автоповтор.
+    /// Зажата хоть одна клавиша яркости. По переходу false→true контур
+    /// запоминает яркость, чтобы было куда откатывать.
     var anyHeld: Bool { lock.lock(); defer { lock.unlock() }; return upHeld || downHeld }
 
-    func takePending() -> Bool {
+    /// true ровно один раз — когда обе продержались вместе не меньше minHold.
+    func matureIfReady(minHold: TimeInterval) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        let p = pending; pending = false; return p
+        guard let since = bothSince, !matured,
+              Date().timeIntervalSince(since) >= minHold else { return false }
+        matured = true
+        return true
+    }
+
+    /// true один раз, если обе были зажаты, но их отпустили до созревания.
+    func takeCancel() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let c = pendingCancel; pendingCancel = false; return c
     }
 }
-
-/// Судьба нажатия каждой клавиши: пропустили мы его в систему или проглотили.
-///
-/// Отпускание обязано повторить судьбу нажатия. Если нажатие ушло в систему, а
-/// отпускание проглотить, система не узнает, что клавишу отпустили, и будет
-/// повторять её до упора шкалы. Ровно это и роняло яркость в ноль.
 final class KeyPassState: @unchecked Sendable {
     private let lock = NSLock()
     private var swallowedUpKey = false
@@ -787,7 +876,10 @@ let eventTrace = EventTraceFlag()
 /// Свайп смены рабочего стола сыплет событиями типа 29 с того мгновения, как
 /// пальцы поехали, — то есть заранее, до анимации. Номер пространства для этого
 /// не годится: он меняется уже в конце перехода, когда полосы нарисованы.
-final class GestureClock: @unchecked Sendable {
+/// Когда в последний раз трогали устройство ввода. Один и тот же приём для
+/// трекпада и для клавиш яркости: обработчик только отмечает время, решение
+/// принимает контур.
+final class TouchClock: @unchecked Sendable {
     private let lock = NSLock()
     private var last = Date.distantPast
     func touch() { lock.lock(); last = Date(); lock.unlock() }
@@ -797,7 +889,12 @@ final class GestureClock: @unchecked Sendable {
     }
 }
 
-let gestureClock = GestureClock()
+let gestureClock = TouchClock()
+
+/// Последнее событие клавиш яркости — включая те, что мы пропускаем в систему.
+/// Приходит раньше, чем система успевает довести подсветку, и это единственный
+/// способ убрать руки с яркости ДО того, как человек увидит борьбу.
+let keysClock = TouchClock()
 
 private let gestureTapCallback: CGEventTapCallBack = { _, type, event, _ in
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
@@ -886,6 +983,10 @@ private let brightnessTapCallback: CGEventTapCallBack = { _, type, event, _ in
     }
     let isUp = keyCode == nxKeyBrightnessUp
     let keyDown = ((ns.data1 & 0x0000_FF00) >> 8) == 0x0A
+
+    // Отмечаем и нажатие, и отпускание, и автоповтор, и те события, что уйдут
+    // в систему нетронутыми: контуру важен сам факт, что рука на яркости.
+    keysClock.touch()
 
     chordState.note(up: isUp, isDown: keyDown, window: 0.4)
 
@@ -1159,6 +1260,10 @@ protocol LumaSource: AnyObject {
     var luma: Double? { get }
     /// Сколько прошло с последнего кадра. Растёт, только если съём встал.
     var silence: TimeInterval { get }
+    /// Сколько кадров доставлено. По нему отличают новый кадр от повтора того
+    /// же самого: значение светлоты для этого не годится — два разных кадра
+    /// могут дать одинаковое число, и «устоялось» сработало бы вхолостую.
+    var frames: UInt64 { get }
     /// Забирает и очищает последнюю ошибку.
     func takeFailure() -> String?
     func start() async throws
@@ -1180,6 +1285,7 @@ final class ShotSampler: LumaSource, @unchecked Sendable {
     private let lock = NSLock()
     private var _luma: Double?
     private var _lastDelivery = Date.distantPast
+    private var _frames: UInt64 = 0
     private var _failure: String?
 
     private var task: Task<Void, Never>?
@@ -1200,13 +1306,15 @@ final class ShotSampler: LumaSource, @unchecked Sendable {
         return Date().timeIntervalSince(_lastDelivery)
     }
 
+    var frames: UInt64 { lock.lock(); defer { lock.unlock() }; return _frames }
+
     func takeFailure() -> String? {
         lock.lock(); defer { lock.unlock() }
         let f = _failure; _failure = nil; return f
     }
 
     private func publish(_ value: Double) {
-        lock.lock(); _luma = value; _lastDelivery = Date(); lock.unlock()
+        lock.lock(); _luma = value; _lastDelivery = Date(); _frames &+= 1; lock.unlock()
     }
 
     private func publish(failure: String) {
@@ -1266,6 +1374,7 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
     private let lock = NSLock()
     private var _luma: Double?
     private var _lastDelivery = Date.distantPast
+    private var _frames: UInt64 = 0
     private var _failure: String?
 
     private var stream: SCStream?
@@ -1289,6 +1398,8 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
         lock.lock(); defer { lock.unlock() }
         return Date().timeIntervalSince(_lastDelivery)
     }
+
+    var frames: UInt64 { lock.lock(); defer { lock.unlock() }; return _frames }
 
     /// Забирает и очищает последнюю ошибку потока.
     func takeFailure() -> String? {
@@ -1350,7 +1461,7 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
               let pixels = sb.imageBuffer else { return }
 
         let l = LiveSampler.perceivedLuma(pixels)
-        lock.lock(); _luma = l; lock.unlock()
+        lock.lock(); _luma = l; _frames &+= 1; lock.unlock()
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -1584,6 +1695,9 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     // Начало текущего хода — ради строчки в логе «откуда и за сколько».
     var moveFrom: Double? = nil
     var moveStarted = Date()
+    // Сколько раз за ход реально записали подсветку. Ступеньки на глаз — это
+    // вопрос о размере шага, а он считается отсюда, а не прикидывается.
+    var moveWrites = 0
 
     // Пауза на время игры: яркость не трогаем вообще и съём кадров глушим —
     // он стоит около 20% одного ядра, а игре эти такты нужнее.
@@ -1617,6 +1731,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     }
     var lastSpace = spaceWatch.current()
     var spaceSettleUntil = Date.distantPast
+    var spaceGraceUntil = Date.distantPast
     var spaceSuspended = false
     var screenWasUsable = true
     var wakeSettleUntil = Date.distantPast
@@ -1633,9 +1748,87 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     var captureDown = false
     var lastRestart = Date.distantPast
     var paused = false
+
+    // ── Ручная правка клавишами ──────────────────────────────────────────────
+    // Пока серия идёт, демон нем: не пишет подсветку и не трогает lastWritten.
+    // Это не оптимизация, а условие корректности. Стоит ему записать своё
+    // значение — и расхождение «записал vs стоит», единственный след правки,
+    // исчезает вместе с ней: следующий такт видит ровно то, что сам же и
+    // выставил, и правка пропадает бесследно. Так и терялись тапы.
+    var keysSeries = false
+    /// lastWritten на момент начала серии — с ним сверяем итог, а не с тем, что
+    /// демон успел бы записать по дороге.
+    var keysSeriesWritten = 0.0
+    var keysSeriesActual = 0.0
+    var keysSeriesStill = Date()
+    var keysSeriesStart = Date()
+
+    // Светлота после правки ещё не установилась: сглаженная догоняет сырую.
+    // Пока догоняет, точка отсчёта дописывается свежей светлотой.
+    var lumaSettling = false
+    var lumaSettlingUntil = Date.distantPast
+
+    // ── Ожидание устоявшейся светлоты ────────────────────────────────────────
+    // После перехода (жест, смена стола) светлоту берём не первую попавшуюся, а
+    // устоявшуюся: пока анимация идёт, кадры показывают смесь старого и нового,
+    // и тронувшись по такому кадру, демон едет второй раз — переход выходит
+    // двухступенчатым.
+    //
+    // Ждать этого НЕЛЬЗЯ блокирующе. Первая версия крутила `await` прямо в
+    // такте, и пока она ждала, демон не делал ничего — ни ведения, ни реакции
+    // на жесты. При коротком `gestureSettle` заглушка снимается от малейшей
+    // паузы в движении пальцев, цикл тут же уходил в полуторасекундное
+    // ожидание, и так по кругу: снаружи это выглядело как залипание.
+    var steadyWait = false
+    var steadyUntil = Date.distantPast
+    var steadyPrev: Double? = nil
+    var steadySeen: UInt64 = 0
+
+    /// Открыть ожидание устоявшейся светлоты после перехода.
+    func awaitSteady(_ timeout: Double = 1.5) {
+        steadyWait = true
+        steadyUntil = Date().addingTimeInterval(timeout)
+        steadyPrev = nil
+        steadySeen = sampler.frames
+    }
     var pauseBrightness = initialBrightness
     var pauseCheckTick = 0
     var pauseReason = ""
+
+    /// Гасит ход и под трассировкой пишет, кто именно его прервал. Прерванный
+    /// ход в лог не попадает — строка «вёл X → Y» печатается только по
+    /// завершении, — и переход, разорванный надвое, выглядит в логе как один
+    /// ход неизвестно откуда.
+    func halt(_ reason: String) {
+        if moveFrom != nil, config.traceEvents || config.traceKeys {
+            log("  [ход] прерван на \(pct(current)): \(reason)")
+        }
+        velocity = 0
+        moveFrom = nil
+    }
+
+    /// Принять выставленное рукой значение: ход гасим, значение становится
+    /// точкой отсчёта при текущей светлоте, адаптация уходит в паузу до смены
+    /// контента. Одна дорога для клавиш, Control Center и системного датчика.
+    func acceptManual(_ value: Double) {
+        velocity = 0
+        current = value
+        moveFrom = nil
+        state.baseline = value
+        state.baselineLuma = smoothedLuma
+        state.lastWritten = value
+        holding = true
+        holdLuma = smoothedLuma
+        state.holdLuma = smoothedLuma
+        // Светлота могла не устояться — тогда точку отсчёта допишем, когда
+        // сглаженная догонит сырую.
+        lumaSettling = true
+        lumaSettlingUntil = Date().addingTimeInterval(max(0, config.lumaSettleMax))
+        state.save()
+        liveState.set(state)
+        manualPending = true
+        manualAt = Date()
+    }
 
     while true {
         try? await Task.sleep(nanoseconds: UInt64(dtControl * 1_000_000_000))
@@ -1664,6 +1857,40 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         boostTick &+= 1
         var frozenByGesture = false
 
+        // ── Ручная серия на клавишах яркости ─────────────────────────────────
+        // Открываем её по первому же событию клавиши — tap видит его раньше,
+        // чем система успевает тронуть подсветку. Флаг поднимаем здесь, до
+        // всех веток с `continue`: ниже по такту есть ветки, которые
+        // синхронизируют lastWritten с прочитанным, и им нельзя дать стереть
+        // след правки, пока серия не закрыта.
+        if config.keySettle > 0 {
+            if !keysSeries, keysClock.secondsSince() < config.keySettle {
+                keysSeries = true
+                keysSeriesWritten = state.lastWritten
+                keysSeriesActual = actual
+                keysSeriesStill = Date()
+                keysSeriesStart = Date()
+            }
+            if keysSeries, abs(actual - keysSeriesActual) > 1e-4 {
+                // Подсветка ещё едет — рамп системы не закончен.
+                keysSeriesActual = actual
+                keysSeriesStill = Date()
+            }
+        }
+
+        // Серия нажатий — это одна правка, строку пишем по её затиханию.
+        // Печатаем здесь, до всех веток с `continue`: раньше строка стояла в
+        // самом низу такта, и пока шёл жест или пауза, цикл до неё не доходил
+        // — правка появлялась в логе через секунды после того, как случилась,
+        // рядом с чужими событиями. Разбирать такой лог невозможно.
+        if manualPending, Date().timeIntervalSince(manualAt) > config.manualQuietPeriod {
+            manualPending = false
+            log(String(format: "ручная правка → baseline %@ при светлоте %.3f (norm %.2f); держу, пока контент не сменится",
+                       pct(state.baseline), state.baselineLuma,
+                       normalizedLuma(state.baselineLuma, config)))
+            if singleShot { return }
+        }
+
         // ── Жест на трекпаде ─────────────────────────────────────────────────
         // Пока пальцы на трекпаде и полсекунды после — не снимаем кадров.
         // Это единственный сигнал, приходящий ДО анимации перехода: номер
@@ -1675,8 +1902,8 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 if !gestureSuspended {
                     gestureSuspended = true
                     sampler.setSuspended(true)
-                    velocity = 0
-                    moveFrom = nil
+                    halt("жест на трекпаде")
+                    if config.traceEvents || config.traceKeys { log("  [жест] съём заглушен") }
                 }
                 // Раньше здесь был continue — и пока рука лежала на трекпаде,
                 // цикл не доходил ни до выключателя, ни до клавиш, ни до буста.
@@ -1685,15 +1912,12 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             } else if gestureSuspended {
                 gestureSuspended = false
                 sampler.setSuspended(false)
-                // Контент за время жеста наверняка другой — берём свежий кадр
-                // как есть, без сглаживания от протухшего.
-                let before = sampler.luma
-                var w = 0.0
-                while w < 1.5 {
-                    try? await Task.sleep(nanoseconds: 50_000_000)
-                    w += 0.05
-                    if let fresh = sampler.luma, fresh != before { smoothedLuma = fresh; break }
-                }
+                // Контент за время жеста наверняка другой — светлоту возьмём
+                // заново, без сглаживания от протухшей, но не первую
+                // попавшуюся: заглушка отпускает через gestureSettle после
+                // того, как убрали пальцы, а анимация к этому моменту ещё идёт.
+                awaitSteady()
+                if config.traceEvents || config.traceKeys { log("  [жест] отпущен, жду устоявшуюся светлоту") }
                 lastTick = Date()
                 continue
             }
@@ -1704,33 +1928,35 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         // запрос на захват в этот момент рвёт кадр вертикальными полосами.
         if config.spaceSettle > 0, spaceWatch.available {
             let now = spaceWatch.current()
-            if now != lastSpace {
+            if now != lastSpace, config.traceEvents || config.traceKeys {
+                log(String(format: "  [стол] номер %d → %d, отсрочка %@",
+                           Int(lastSpace), Int(now),
+                           Date() < spaceGraceUntil
+                               ? String(format: "ещё действует (%.2fс)", spaceGraceUntil.timeIntervalSinceNow)
+                               : "истекла — глушу съём"))
+            }
+            if now != lastSpace, Date() >= spaceGraceUntil {
                 lastSpace = now
                 spaceSettleUntil = Date().addingTimeInterval(config.spaceSettle)
                 if !spaceSuspended {
                     spaceSuspended = true
                     sampler.setSuspended(true)
                 }
-                velocity = 0
-                moveFrom = nil
+                halt("смена рабочего стола")
             }
+            if now != lastSpace { lastSpace = now }
             if spaceSuspended {
                 if Date() < spaceSettleUntil {
                     current = actual
-                    state.lastWritten = actual
+                    if !keysSeries { state.lastWritten = actual }
                     continue
                 }
                 spaceSuspended = false
                 sampler.setSuspended(false)
                 // Светлота за время перехода протухла: контент другой.
-                // Берём первый же свежий кадр как есть, без сглаживания.
-                var w = 0.0
-                let before = sampler.luma
-                while w < 1.5 {
-                    try? await Task.sleep(nanoseconds: 50_000_000)
-                    w += 0.05
-                    if let fresh = sampler.luma, fresh != before { smoothedLuma = fresh; break }
-                }
+                // Берём устоявшуюся, а не первую попавшуюся: пока анимация
+                // доигрывает, кадры показывают смесь старого и нового.
+                awaitSteady()
                 lastTick = Date()
                 continue
             }
@@ -1745,6 +1971,11 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             if Date() < chordRestoreUntil || chordState.anyHeld {
                 if chordState.anyHeld { chordRestoreUntil = Date().addingTimeInterval(0.5) }
                 if !dryRun, abs(actual - v) > 1e-4 { backlight.write(display, v) }
+                // Аккорд правит яркость сам и сам знает, к чему её вернуть.
+                // Открытую его же клавишами серию закрываем, иначе она сверит
+                // откат с тем, что было до аккорда, и примет его за ручную
+                // правку.
+                keysSeries = false
                 state.lastWritten = v
                 current = v
                 velocity = 0
@@ -1760,7 +1991,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         // её правки ручными — иначе baseline уедет на случайную точку рампа.
         if Date() < wakeSettleUntil {
             current = actual
-            state.lastWritten = actual
+            if !keysSeries { state.lastWritten = actual }
             velocity = 0
             moveFrom = nil
             continue
@@ -1814,7 +2045,25 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             }
             keysWereHeld = heldNow
 
-            if chordState.takePending() {
+            if chordState.takeCancel(), let back = preKeys {
+                // Обе клавиши были зажаты, но их отпустили до созревания —
+                // команды не было. События мы проглотили, поэтому возвращаем
+                // яркость к тому, что было до нажатий.
+                log(String(format: "аккорд не созрел — возвращаю %@, какой была до нажатий",
+                           pct(back.brightness)))
+                chordRestore = back.brightness
+                chordRestoreUntil = Date().addingTimeInterval(0.3)
+                if !dryRun { backlight.write(display, back.brightness) }
+                state.lastWritten = back.brightness
+                state.baseline = back.baseline
+                state.baselineLuma = back.baselineLuma
+                current = back.brightness
+                preKeys = nil
+                _ = keyIntent.take()
+                continue
+            }
+
+            if chordState.matureIfReady(minHold: config.chordHold) {
                 state.enabled.toggle()
                 state.holdLuma = nil
                 holding = false
@@ -1830,6 +2079,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 chordRestore = restore.brightness
                 chordRestoreUntil = Date().addingTimeInterval(0.5)
                 if !dryRun { backlight.write(display, restore.brightness) }
+                keysSeries = false
                 state.lastWritten = restore.brightness
                 state.baseline = restore.baseline
                 state.baselineLuma = restore.baselineLuma
@@ -1909,6 +2159,13 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 try? await Task.sleep(nanoseconds: 50_000_000)
             }
             let settledBrightness = backlight.read(display) ?? preBoostBrightness
+            // Серию, открытую клавишами внутри буста, закрываем здесь же и
+            // молча. Иначе она доживёт до следующего такта и сверит
+            // возвращённую яркость с потолком, на котором стоял буст: разница
+            // огромная, и демон объявит ручную правку, которой не было, —
+            // адаптация встанет до самой смены контента. Буст — отдельный
+            // режим, а не новая точка отсчёта.
+            keysSeries = false
             state.lastWritten = settledBrightness
             current = settledBrightness
             velocity = 0
@@ -1931,9 +2188,11 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         // Жест на трекпаде: съём заглушен, вести яркость не по чему.
         if frozenByGesture {
             current = actual
-            state.lastWritten = actual
-            velocity = 0
-            moveFrom = nil
+            // Пока идёт ручная серия — не синхронизируемся: окно переключают
+            // свайпом и тут же правят яркость клавишами, и эта ветка успевала
+            // стереть правку раньше, чем её кто-либо видел.
+            if !keysSeries { state.lastWritten = actual }
+            halt("жест на трекпаде (ведение заморожено)")
             continue
         }
 
@@ -1941,6 +2200,10 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         // при этом продолжают работать: выключатель про адаптацию, а не про всё.
         if !state.enabled {
             current = actual
+            // Серию не копим: пока адаптация выключена, вести нечего, а дожив
+            // до включения, она закрылась бы ручной правкой и тут же увела
+            // демона в паузу — ровно против смысла включения.
+            keysSeries = false
             state.lastWritten = actual
             velocity = 0
             moveFrom = nil
@@ -1965,8 +2228,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 paused = true
                 pauseReason = reason
                 pauseBrightness = actual
-                velocity = 0
-                moveFrom = nil
+                halt("пауза: \(reason)")
                 await sampler.stop()
                 log("пауза: \(reason). Яркость оставляю на \(pct(actual)), съём остановлен")
             } else if reason.isEmpty, paused {
@@ -2023,13 +2285,47 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 lastRestart = Date()
                 try? await sampler.start()
             }
-            velocity = 0
-            moveFrom = nil
+            halt("съём встал")
             continue
         }
         if captureDown {
             captureDown = false
             log("съём восстановлен")
+        }
+
+        // Ждём устоявшуюся светлоту после перехода. Цикл при этом живой:
+        // реагирует на жесты, клавиши и буст — просто не ведёт яркость.
+        if steadyWait {
+            let seen = sampler.frames
+            if seen != steadySeen, let value = sampler.luma {
+                steadySeen = seen
+                if let prev = steadyPrev, abs(value - prev) <= config.lumaSettleEps {
+                    smoothedLuma = value
+                    steadyWait = false
+                } else {
+                    steadyPrev = value
+                }
+            }
+            if steadyWait, Date() >= steadyUntil {
+                // Анимация затянулась или контент живой и не устаивается вовсе
+                // (видео). Берём что есть — это всё равно лучше протухшего.
+                if let value = sampler.luma { smoothedLuma = value }
+                steadyWait = false
+            }
+            if steadyWait {
+                halt("жду устоявшуюся светлоту")
+                continue
+            }
+            // Переход закончился. Номер стола SkyLight отдаёт позже картинки,
+            // поэтому дальше ему какое-то время не верим: иначе он заглушит
+            // съём второй раз и разорвёт уже идущий ход пополам.
+            lastSpace = spaceWatch.current()
+            spaceGraceUntil = Date().addingTimeInterval(max(0, config.spaceGrace))
+            lastTick = Date()
+            if config.traceEvents || config.traceKeys {
+                log(String(format: "  [переход] светлота устоялась на %.3f, стол=%d, отсрочка %.1fс",
+                           smoothedLuma, Int(lastSpace), config.spaceGrace))
+            }
         }
 
         if let raw = sampler.luma {
@@ -2044,6 +2340,52 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             }
         }
 
+        // ── Светлота после правки ещё едет ───────────────────────────────────
+        // Сглаживание имеет инерцию `tauLuma`, и правка сразу после
+        // переключения окна попадает на полпути: baseline привязался бы к
+        // светлоте, которой на экране не было. Через секунду сглаженная
+        // доходит до настоящей, расхождение с ней перешагивает порог — и
+        // демон объявляет «контент сменился», хотя окно всё то же, и едет
+        // обратно. Поэтому пока сглаженная догоняет сырую, точку отсчёта
+        // дописываем свежей светлотой.
+        if lumaSettling {
+            if !holding || Date() >= lumaSettlingUntil {
+                lumaSettling = false
+            } else if let raw = sampler.luma, abs(raw - smoothedLuma) > config.lumaSettleEps {
+                state.baselineLuma = smoothedLuma
+                holdLuma = smoothedLuma
+                state.holdLuma = smoothedLuma
+            } else {
+                lumaSettling = false
+                state.save()
+                liveState.set(state)
+            }
+        }
+
+        // ── Рука на клавишах яркости ─────────────────────────────────────────
+        // Серия закрывается не по таймеру, а по факту: клавиши затихли И
+        // подсветка перестала меняться. Таймер сам по себе ничего не
+        // гарантировал — стоило системному рампу не уложиться в него, и
+        // пружина записывала своё значение поверх, стирая след правки вместе
+        // с самой правкой. Теперь до закрытия серии демон не пишет вообще.
+        if keysSeries {
+            halt("клавиши яркости")
+
+            let quiet = keysClock.secondsSince() >= config.keySettle
+            let still = Date().timeIntervalSince(keysSeriesStill) >= config.keyStill
+            let overdue = Date().timeIntervalSince(keysSeriesStart) >= config.keySeriesMax
+            guard (quiet && still) || overdue else { continue }
+
+            keysSeries = false
+            if !dryRun, abs(actual - keysSeriesWritten) > config.manualEpsilon {
+                acceptManual(actual)
+                continue
+            }
+            // Ничего не изменилось: упёрлись в край шкалы или нажатие ушло
+            // мимо. Выдумывать ручную правку не за чем — ведём дальше.
+            current = actual
+        }
+
         // ── Внешняя правка ───────────────────────────────────────────────────
         // Чтение возвращает записанное бит-в-бит, поэтому любое расхождение —
         // это не мы: клавиши, Control Center или системный датчик освещённости.
@@ -2051,33 +2393,12 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         // ровно там, где нас остановили, а выставленное значение принимаем за
         // новый baseline при текущей светлоте.
         if !dryRun, abs(actual - state.lastWritten) > config.manualEpsilon {
-            velocity = 0
-            current = actual
-            moveFrom = nil
-            state.baseline = actual
-            state.baselineLuma = smoothedLuma
-            state.lastWritten = actual
-            holding = true
-            holdLuma = smoothedLuma
-            state.holdLuma = smoothedLuma
-            state.save()
-            liveState.set(state)
-            manualPending = true
-            manualAt = Date()
+            acceptManual(actual)
             continue
         }
         if dryRun {
             state.lastWritten = actual
             if moveFrom == nil { current = actual }
-        }
-
-        // Серия нажатий — это одна правка. Строку пишем, когда клавиши затихли.
-        if manualPending, Date().timeIntervalSince(manualAt) > config.manualQuietPeriod {
-            manualPending = false
-            log(String(format: "ручная правка → baseline %@ при светлоте %.3f (norm %.2f); держу, пока контент не сменится",
-                       pct(state.baseline), state.baselineLuma,
-                       normalizedLuma(state.baselineLuma, config)))
-            if singleShot { return }
         }
 
         // ── Пауза до смены контента ──────────────────────────────────────────
@@ -2107,6 +2428,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             guard abs(target - current) > config.startThreshold else { continue }
             moveFrom = current
             moveStarted = Date()
+            moveWrites = 0
         }
 
         // Критически демпфированная пружина в устойчивой дискретной форме.
@@ -2140,14 +2462,21 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             if !dryRun { backlight.write(display, current) }
             state.lastWritten = current
             liveState.set(state)
+            if moveFrom != nil { moveWrites += 1 }
         }
 
         if settled, let from = moveFrom {
             if !dryRun { state.save() }
             liveState.set(state)
-            log(String(format: "luma=%.3f (norm %.2f)  вёл %@ → %@, %.1fс%@",
+            let elapsed = Date().timeIntervalSince(moveStarted)
+            let stepPct = moveWrites > 0 ? abs(target - from) / Double(moveWrites) * 100 : 0
+            log(String(format: "luma=%.3f (norm %.2f)  вёл %@ → %@, %.1fс%@%@",
                        smoothedLuma, normalizedLuma(smoothedLuma, config),
-                       pct(from), pct(target), Date().timeIntervalSince(moveStarted),
+                       pct(from), pct(target), elapsed,
+                       (config.traceEvents || config.traceKeys)
+                           ? String(format: "  [%d записей, %.1f/с, шаг %.2f%%]",
+                                    moveWrites, elapsed > 0 ? Double(moveWrites) / elapsed : 0, stepPct)
+                           : "",
                        dryRun ? "  [не применено]" : ""))
             moveFrom = nil
             if singleShot { return }
