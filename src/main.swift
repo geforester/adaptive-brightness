@@ -96,6 +96,10 @@ struct Config {
     /// система закончит, и только потом синхронизируемся и продолжаем.
     var wakeSettle: Double = 2.0
 
+    /// Разведка при старте: что демон видит на неактивных столах. Пишет в лог
+    /// по строке на стол и выключается сам — это диагностика, не режим работы.
+    var probeSpaces = false
+
     /// Писать в лог каждое событие клавиш яркости — для разбора проблем.
     var traceKeys = false
 
@@ -188,6 +192,7 @@ struct Config {
         c.wakeSettle      = d("wakeSettle", c.wakeSettle)
         c.maxBoost        = d("maxBoost", c.maxBoost)
         c.nativeKeysBoost = (raw["nativeKeysBoost"] as? NSNumber)?.boolValue ?? c.nativeKeysBoost
+        c.probeSpaces     = (raw["probeSpaces"] as? NSNumber)?.boolValue ?? c.probeSpaces
         c.traceKeys       = (raw["traceKeys"] as? NSNumber)?.boolValue ?? c.traceKeys
         c.traceEvents     = (raw["traceEvents"] as? NSNumber)?.boolValue ?? c.traceEvents
         c.startupGrace    = d("startupGrace", c.startupGrace)
@@ -529,7 +534,109 @@ final class SpaceWatch {
 
     /// 0, если функция недоступна — тогда смена пространства просто не ловится.
     func current() -> UInt64 { activeSpace?(cid) ?? 0 }
+
+    // ── Заглянуть на соседние столы ──────────────────────────────────────────
+    // Mission Control показывает живые миниатюры каждого стола, значит данные
+    // есть и система умеет их отрисовать. Добирается до них Dock приватным
+    // путём: список столов и их окон из SkyLight, содержимое —
+    // `CGSHWCaptureWindowList`, та же функция, что рисует те миниатюры.
+    //
+    // Из процесса без разрешения на запись экрана она не отказывает, а молча
+    // отдаёт пустой массив вместо картинки, причём даже для окон активного
+    // стола. Поэтому проверять её можно только отсюда, из демона: у CLI,
+    // запущенного из терминала, права принадлежат терминалу.
+
+    private typealias CopyDisplaySpacesFn = @convention(c) (Int32) -> CFArray?
+    private typealias CopyWindowsFn = @convention(c) (Int32, UInt32, CFArray, UInt32,
+                                                      UnsafeMutablePointer<UInt64>,
+                                                      UnsafeMutablePointer<UInt64>) -> CFArray?
+    private typealias HWCaptureFn = @convention(c) (Int32, UnsafePointer<UInt32>, UInt32, UInt32) -> CFArray?
+
+    /// Все столы по дисплеям, в порядке их расположения.
+    func spaces() -> [(display: String, ids: [UInt64])] {
+        let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
+        guard let f = dlsym(sky, "CGSCopyManagedDisplaySpaces").map({ unsafeBitCast($0, to: CopyDisplaySpacesFn.self) }),
+              let raw = f(cid) as? [[String: Any]] else { return [] }
+        return raw.map { d in
+            let ids = (d["Spaces"] as? [[String: Any]] ?? []).compactMap { $0["id64"] as? UInt64 }
+            return (display: (d["Display Identifier"] as? String) ?? "?", ids: ids)
+        }
+    }
+
+    /// Номера окон на указанном столе, сверху вниз по z-порядку.
+    func windows(on space: UInt64) -> [UInt32] {
+        let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
+        guard let f = dlsym(sky, "CGSCopyWindowsWithOptionsAndTags").map({ unsafeBitCast($0, to: CopyWindowsFn.self) })
+        else { return [] }
+        var setTags: UInt64 = 0, clearTags: UInt64 = 0
+        return f(cid, 0, [space] as CFArray, 2, &setTags, &clearTags) as? [UInt32] ?? []
+    }
+
+    /// Содержимое окна, даже если оно на неактивном столе. nil — система не
+    /// отдала картинку.
+    func capture(window: UInt32) -> CGImage? {
+        let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW)
+        guard let f = dlsym(sky, "CGSHWCaptureWindowList").map({ unsafeBitCast($0, to: HWCaptureFn.self) })
+        else { return nil }
+        var one = window
+        // 0x0200 — снимать в номинальном разрешении, 0x0800 — не обрезать по
+        // видимой области: окно на другом столе целиком за границей экрана.
+        return (f(cid, &one, 1, 0x0200 | 0x0800) as? [CGImage])?.first
+    }
 }
+
+/// Разведка: перечислить столы и посмотреть, отдаёт ли система содержимое окон
+/// на тех из них, где мы сейчас не находимся.
+func reportSpaces(_ watch: SpaceWatch) {
+    let active = watch.current()
+    let started = Date()
+    log("── разведка столов ──")
+    for d in watch.spaces() {
+        log("  дисплей \(d.display): столов \(d.ids.count)")
+        for sid in d.ids {
+            let wins = watch.windows(on: sid)
+            var got = 0, empty = 0, biggest = 0
+            var biggestLuma: Double? = nil
+            var sizes: [String] = []
+            for w in wins.prefix(20) {
+                guard let img = watch.capture(window: w) else { empty += 1; continue }
+                got += 1
+                let area = img.width * img.height
+                if sizes.count < 4 { sizes.append("\(img.width)x\(img.height)") }
+                if area > biggest, let l = imageLuma(img) { biggest = area; biggestLuma = l }
+            }
+            log(String(format: "    стол %d%@: окон %d, снято %d, пусто %d; крупнейшее %@ светлота %@%@",
+                       Int(sid), sid == active ? " (активный)" : "",
+                       wins.count, got, empty,
+                       biggest > 0 ? "\(biggest)px" : "—",
+                       biggestLuma.map { String(format: "%.3f", $0) } ?? "—",
+                       sizes.isEmpty ? "" : "  [\(sizes.joined(separator: ", "))]"))
+        }
+    }
+    // Цена вопроса: если опрашивать столы регулярно, она войдёт в постоянный
+    // расход демона, и тогда решать, делать это по таймеру или только по
+    // событию жеста.
+    log(String(format: "── конец разведки, всё заняло %.0f мс ──", Date().timeIntervalSince(started) * 1000))
+}
+
+/// Воспринимаемая светлота готовой картинки — та же шкала, что у кадров экрана.
+func imageLuma(_ image: CGImage, width: Int = 64, height: Int = 40) -> Double? {
+    var buf = [UInt8](repeating: 0, count: width * height * 4)
+    guard let ctx = CGContext(data: &buf, width: width, height: height, bitsPerComponent: 8,
+                              bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    var sum = 0.0
+    for i in stride(from: 0, to: buf.count, by: 4) {
+        sum += 0.2126 * linearLUT[Int(buf[i])]
+             + 0.7152 * linearLUT[Int(buf[i + 1])]
+             + 0.0722 * linearLUT[Int(buf[i + 2])]
+    }
+    let mean = sum / Double(width * height)
+    return pow(max(0, min(1, mean)), 1.0 / 2.2)
+}
+
+
 
 /// Bundle id приложения на переднем плане. NSWorkspace не требует никаких
 /// разрешений — в отличие от AppleScript, которому нужен Automation.
@@ -1504,6 +1611,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     }
     var gestureSuspended = false
     let spaceWatch = SpaceWatch()
+    if config.probeSpaces { reportSpaces(spaceWatch) }
     if !spaceWatch.available {
         log("ВНИМАНИЕ: номер рабочего стола недоступен — съём на смене десктопа глушиться не будет")
     }
