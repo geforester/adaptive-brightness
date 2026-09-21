@@ -359,6 +359,68 @@ func notify_get_state(_ token: Int32, _ state: UnsafeMutablePointer<UInt64>) -> 
 func notify_set_state(_ token: Int32, _ state: UInt64) -> UInt32
 @_silgen_name("notify_post")
 func notify_post(_ name: UnsafePointer<CChar>) -> UInt32
+@_silgen_name("notify_cancel")
+func notify_cancel(_ token: Int32) -> UInt32
+
+/// Токен notify(3), взятый один раз на весь процесс.
+///
+/// Регистрация не бесплатная и сама не убирается: каждый
+/// `notify_register_check` занимает слот в таблице процесса, и слотов ровно
+/// 10 000. При попытке занять 10 001-й libnotify не возвращает ошибку, а
+/// убивает процесс SIGTRAP. Отсюда были падения каждые три минуты: два чтения
+/// на такт 30 Гц выбирали лимит за ~166 секунд, launchd поднимал демон заново,
+/// а заодно macOS переспрашивала разрешение на запись экрана.
+///
+/// Поэтому токен берётся один раз и живёт до конца процесса. Если notifyd
+/// перезапустится, токен протухнет — операция, вернувшая ошибку, освобождает
+/// слот и сбрасывает кэш, и следующий вызов регистрируется заново. Число таких
+/// перерегистраций ограничено: даже если освободить слот не удастся, к лимиту
+/// это подойти не даст.
+final class NotifyToken: @unchecked Sendable {
+    private static let maxRetries = 64
+
+    private let name: String
+    private let lock = NSLock()
+    private var token: Int32 = -1
+    private var retries = 0
+
+    init(_ name: String) { self.name = name }
+
+    /// Токен, регистрируя его при первом обращении. nil — зарегистрировать не
+    /// вышло или запас перерегистраций исчерпан.
+    private func acquire() -> Int32? {
+        lock.lock(); defer { lock.unlock() }
+        if token >= 0 { return token }
+        guard retries <= NotifyToken.maxRetries else { return nil }
+        retries += 1
+        var t: Int32 = 0
+        guard notify_register_check(name, &t) == 0 else { return nil }
+        token = t
+        return t
+    }
+
+    private func invalidate() {
+        lock.lock(); defer { lock.unlock() }
+        if token >= 0 { _ = notify_cancel(token) }
+        token = -1
+    }
+
+    func get() -> UInt64? {
+        guard let t = acquire() else { return nil }
+        var v: UInt64 = 0
+        guard notify_get_state(t, &v) == 0 else { invalidate(); return nil }
+        return v
+    }
+
+    @discardableResult
+    func set(_ value: UInt64) -> Bool {
+        guard let t = acquire() else { return false }
+        guard notify_set_state(t, value) == 0 else { invalidate(); return false }
+        return true
+    }
+
+    func post() { _ = notify_post(name) }
+}
 
 /// Уровень буста передаётся из CLI в демон через Darwin-уведомление: демон
 /// читает его из разделяемой памяти на каждом такте, это дешевле файла и не
@@ -371,18 +433,15 @@ let boostNotification = "com.geforester.adaptive-brightness.boost"
 let tapStatusNotification = "com.geforester.adaptive-brightness.keytap"
 
 enum TapStatusChannel {
+    private static let channel = NotifyToken(tapStatusNotification)
+
     static func read() -> Bool? {
-        var t: Int32 = 0
-        guard notify_register_check(tapStatusNotification, &t) == 0 else { return nil }
-        var v: UInt64 = 0
-        guard notify_get_state(t, &v) == 0 else { return nil }
+        guard let v = channel.get() else { return nil }
         return v == 2      // 1 — выключен, 2 — включён, 0 — демон не сообщал
     }
 
     static func write(_ active: Bool) {
-        var t: Int32 = 0
-        guard notify_register_check(tapStatusNotification, &t) == 0 else { return }
-        _ = notify_set_state(t, active ? 2 : 1)
+        channel.set(active ? 2 : 1)
     }
 }
 
@@ -391,41 +450,35 @@ enum TapStatusChannel {
 let enableNotification = "com.geforester.adaptive-brightness.enabled"
 
 enum EnableChannel {
+    private static let channel = NotifyToken(enableNotification)
+
     /// nil — никто ещё не сообщал.
     static func read() -> Bool? {
-        var t: Int32 = 0
-        guard notify_register_check(enableNotification, &t) == 0 else { return nil }
-        var v: UInt64 = 0
-        guard notify_get_state(t, &v) == 0, v > 0 else { return nil }
+        guard let v = channel.get(), v > 0 else { return nil }
         return v == 2      // 1 — выключено, 2 — включено
     }
 
     @discardableResult
     static func write(_ on: Bool) -> Bool {
-        var t: Int32 = 0
-        guard notify_register_check(enableNotification, &t) == 0 else { return false }
-        guard notify_set_state(t, on ? 2 : 1) == 0 else { return false }
-        _ = notify_post(enableNotification)
+        guard channel.set(on ? 2 : 1) else { return false }
+        channel.post()
         return true
     }
 }
 
 /// Уровень хранится как целое в тысячных: 1.0 → 1000, 1.35 → 1350.
 enum BoostChannel {
+    private static let channel = NotifyToken(boostNotification)
+
     static func read() -> Double? {
-        var t: Int32 = 0
-        guard notify_register_check(boostNotification, &t) == 0 else { return nil }
-        var v: UInt64 = 0
-        guard notify_get_state(t, &v) == 0, v > 0 else { return nil }
+        guard let v = channel.get(), v > 0 else { return nil }
         return Double(v) / 1000.0
     }
 
     @discardableResult
     static func write(_ level: Double) -> Bool {
-        var t: Int32 = 0
-        guard notify_register_check(boostNotification, &t) == 0 else { return false }
-        guard notify_set_state(t, UInt64((level * 1000).rounded())) == 0 else { return false }
-        _ = notify_post(boostNotification)
+        guard channel.set(UInt64((level * 1000).rounded())) else { return false }
+        channel.post()
         return true
     }
 }
