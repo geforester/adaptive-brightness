@@ -305,14 +305,37 @@ struct State {
     /// объяснить, почему яркость не двигается.
     var holdLuma: Double?
 
+    /// Инвариант модели: на тёмном экране подсветка не тусклее, чем на светлом.
+    /// Перевёрнутая пара — не «другая настройка», а сломанная кривая: тёмная
+    /// IDE становится тусклее светлого браузера, и каждая следующая правка
+    /// уводит концы дальше друг от друга.
+    ///
+    /// Схлопываем в тёмный конец, а он в перевёрнутой паре и есть меньший из
+    /// двух: свести к тусклому безопаснее, чем к яркому — глазам не прилетит.
+    /// Перевёрнутое состояние могло остаться от версии, где `calibrate` не
+    /// следил за порядком, или от правки файла руками.
+    func normalized() -> State {
+        guard dark < light else { return self }
+        log("state.json: точки перепутаны местами (тёмный \(pct(dark)) < светлый \(pct(light))) — " +
+            "свожу обе к \(pct(dark)), светлый конец выстави заново")
+        var s = self
+        s.light = dark
+        return s
+    }
+
     func save() {
+        // Инвариант держим и на записи: в файл не должна попасть перевёрнутая
+        // пара, даже если кто-то соберёт State мимо `normalized()`. Заодно
+        // это чинит покорёженный руками state.json на первой же записи демона:
+        // до неё файл лежит перевёрнутым, хотя в памяти пара уже выправлена.
+        let s = normalized()
         var obj: [String: Any] = [
-            "dark": dark,
-            "light": light,
-            "lastWritten": lastWritten,
+            "dark": s.dark,
+            "light": s.light,
+            "lastWritten": s.lastWritten,
         ]
-        obj["enabled"] = enabled
-        if let h = holdLuma { obj["holdLuma"] = h }
+        obj["enabled"] = s.enabled
+        if let h = s.holdLuma { obj["holdLuma"] = h }
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) else { return }
         try? data.write(to: stateURL, options: .atomic)
     }
@@ -327,7 +350,7 @@ struct State {
         if let d = (raw["dark"] as? NSNumber)?.doubleValue,
            let l = (raw["light"] as? NSNumber)?.doubleValue {
             let w = (raw["lastWritten"] as? NSNumber)?.doubleValue ?? d
-            return State(dark: d, light: l, lastWritten: w, enabled: en, holdLuma: h)
+            return State(dark: d, light: l, lastWritten: w, enabled: en, holdLuma: h).normalized()
         }
 
         // Состояние от прежней модели: одна точка плюс наклон из конфига.
@@ -340,7 +363,7 @@ struct State {
         let l = b * pow(c.span, 1 - ref)
         let w = (raw["lastWritten"] as? NSNumber)?.doubleValue ?? b
         return State(dark: min(1, max(0, d)), light: min(1, max(0, l)),
-                     lastWritten: w, enabled: en, holdLuma: h)
+                     lastWritten: w, enabled: en, holdLuma: h).normalized()
     }
 }
 
@@ -1688,7 +1711,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                      light: min(1, max(0, initialBrightness * pow(config.span, 1 - ref))),
                      lastWritten: initialBrightness,
                      enabled: true,
-                     holdLuma: nil)
+                     holdLuma: nil).normalized()
     }()
     if !hadState {
         log("Стартовые точки: тёмный экран \(pct(state.dark)), светлый \(pct(state.light)) — прикинуты от span, поправь руками")
@@ -1816,6 +1839,8 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     /// Выставленное рукой значение, которое ждёт, пока светлота устоится и
     /// станет ясно, в чью зону оно попало.
     var pendingManual: Double? = nil
+    /// Когда правку приняли — чтобы видеть в логе, сколько она ждала зоны.
+    var pendingManualAt = Date()
 
     // ── Ожидание устоявшейся светлоты ────────────────────────────────────────
     // После перехода (жест, смена стола) светлоту берём не первую попавшуюся, а
@@ -1870,6 +1895,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         holdLuma = smoothedLuma
         state.holdLuma = smoothedLuma
         pendingManual = value
+        pendingManualAt = Date()
         lumaSettling = true
         lumaSettlingUntil = Date().addingTimeInterval(max(0, config.lumaSettleMax))
         state.save()
@@ -1884,6 +1910,9 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     /// середине пересчёт усиливается — потому середина в точки и не пишется.
     func calibrate(_ value: Double) {
         let n = normalizedLuma(smoothedLuma, config)
+        let waited = Date().timeIntervalSince(pendingManualAt)
+        let delay = (config.traceEvents || config.traceKeys) && waited < 60
+            ? String(format: "  [ждал зоны %.2fс]", waited) : ""
         let lo = max(0, min(0.5, config.calibrateEdge))
         let clampPoint = { (x: Double) in max(config.minBrightness, min(config.maxBrightness, x)) }
 
@@ -1891,22 +1920,42 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             // value = dark^(1−n) · light^n  ⇒  dark = (value / light^n)^(1/(1−n))
             let light = max(1e-4, state.light)
             state.dark = clampPoint(pow(value / pow(light, n), 1 / max(1e-6, 1 - n)))
+            // Край зоны — это всё ещё экстраполяция: при n близком к lo
+            // показатель 1/(1−n) разгоняет правку, и при близких концах одного
+            // нажатия «тусклее» хватает, чтобы тёмный конец ушёл под светлый.
+            // Пересечение не подрезаем: выставленное рукой значение важнее сохранённого
+            // соседа — иначе демон отыграл бы нажатие назад. Сосед идёт следом,
+            // кривая становится плоской — до первой же правки на светлом экране.
+            let crossed = state.dark < state.light
+            let wasLight = state.light
+            if crossed { state.light = state.dark }
             holding = false
             state.holdLuma = nil
-            log(String(format: "тёмный экран → %@ (светлота %.3f, norm %.2f); светлый остаётся %@",
-                       pct(state.dark), smoothedLuma, n, pct(state.light)))
+            let tail = crossed
+                ? String(format: "светлый был выше (%@) — подтянул туда же, кривая пока плоская", pct(wasLight))
+                : String(format: "светлый остаётся %@", pct(state.light))
+            log(String(format: "тёмный экран → %@ (светлота %.3f, norm %.2f); %@%@",
+                       pct(state.dark), smoothedLuma, n, tail, delay))
         } else if n >= 1 - lo {
             let dark = max(1e-4, state.dark)
             state.light = clampPoint(pow(value / pow(dark, 1 - n), 1 / max(1e-6, n)))
+            // Симметрично тёмной зоне: светлый конец не перепрыгивает тёмный,
+            // а тащит его за собой.
+            let crossed = state.light > state.dark
+            let wasDark = state.dark
+            if crossed { state.dark = state.light }
             holding = false
             state.holdLuma = nil
-            log(String(format: "светлый экран → %@ (светлота %.3f, norm %.2f); тёмный остаётся %@",
-                       pct(state.light), smoothedLuma, n, pct(state.dark)))
+            let tail = crossed
+                ? String(format: "тёмный был ниже (%@) — поднял туда же, кривая пока плоская", pct(wasDark))
+                : String(format: "тёмный остаётся %@", pct(state.dark))
+            log(String(format: "светлый экран → %@ (светлота %.3f, norm %.2f); %@%@",
+                       pct(state.light), smoothedLuma, n, tail, delay))
         } else {
             // Серединка: ни туда ни сюда. Точки не трогаем — держим выставленное
             // до смены контента, как держали бы любую разовую правку.
-            log(String(format: "правка на %@ при светлоте %.3f (norm %.2f) — это середина, точки не трогаю, держу до смены контента",
-                       pct(value), smoothedLuma, n))
+            log(String(format: "правка на %@ при светлоте %.3f (norm %.2f) — это середина, точки не трогаю, держу до смены контента%@",
+                       pct(value), smoothedLuma, n, delay))
         }
         state.save()
         liveState.set(state)
@@ -2646,7 +2695,7 @@ func runReset() async {
         let ref = normalizedLuma(l, config)
         let st = State(dark: min(1, max(0, actual * pow(config.span, -ref))),
                        light: min(1, max(0, actual * pow(config.span, 1 - ref))),
-                       lastWritten: actual, enabled: true, holdLuma: nil)
+                       lastWritten: actual, enabled: true, holdLuma: nil).normalized()
         st.save()
         print("Точки сброшены от текущей яркости \(pct(actual)) при светлоте \(String(format: "%.3f", l)):")
         print("  тёмный экран \(pct(st.dark)), светлый \(pct(st.light))")
