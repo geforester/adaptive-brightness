@@ -1599,6 +1599,23 @@ let logFormatter: DateFormatter = {
 
 var logToFile = false
 
+/// Выдано ли разрешение Screen Recording. В отличие от попытки съёма, окна с
+/// запросом не показывает — поэтому годится для опроса. Каждый `sampler.start()`
+/// без разрешения вызывает системное окно заново, и перезапуск съёма раз в 5 с
+/// превращался в окно раз в 5 с.
+func screenCaptureAllowed() -> Bool { CGPreflightScreenCaptureAccess() }
+
+/// Разрешения нет: окно уже было показано, дальше ждём молча. Когда его выдали —
+/// выходим, и KeepAlive поднимает демон заново: процесс, которому отказали,
+/// съём без перезапуска надёжно не получает.
+func waitForScreenCapturePermission() async -> Never {
+    while !screenCaptureAllowed() {
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+    }
+    log("разрешение на запись экрана выдано — перезапускаюсь")
+    exit(0)
+}
+
 func log(_ message: String) {
     let line = "\(logFormatter.string(from: Date()))  \(message)"
     print(line)
@@ -1665,6 +1682,15 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     var firstLuma: Double? = nil
     var lastStartError = "кадров нет"
     var warnedAboutStart = false
+
+    // Без разрешения съём крутить бессмысленно: каждая попытка — новое окно.
+    // Спрашиваем один раз за жизнь процесса и ждём молча, не выходя: выход
+    // по startupGrace и подъём от KeepAlive снова показали бы окно.
+    if !screenCaptureAllowed() {
+        log("нет разрешения на запись экрана — спрашиваю один раз и жду молча")
+        CGRequestScreenCaptureAccess()
+        await waitForScreenCapturePermission()
+    }
 
     while firstLuma == nil {
         do {
@@ -1816,6 +1842,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     var chordRestoreUntil = Date.distantPast
     var captureDown = false
     var lastRestart = Date.distantPast
+    var permissionLost = false
     var paused = false
 
     // ── Ручная правка клавишами ──────────────────────────────────────────────
@@ -2404,7 +2431,20 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
             }
             if Date().timeIntervalSince(lastRestart) > 5 {
                 lastRestart = Date()
-                try? await sampler.start()
+                if screenCaptureAllowed() {
+                    if permissionLost {
+                        log("разрешение на запись экрана выдано — перезапускаюсь")
+                        exit(0)
+                    }
+                    try? await sampler.start()
+                } else if !permissionLost {
+                    // Окно система уже показала на упавшем съёме. Цикл не
+                    // блокируем: клавиши, буст и аккорд должны жить и дальше.
+                    permissionLost = true
+                    await sampler.stop()
+                    log("разрешение на запись экрана отозвано — съём не перезапускаю, " +
+                        "жду молча; выдать: Настройки → Конфиденциальность → Запись экрана")
+                }
             }
             halt("съём встал")
             continue
@@ -2725,6 +2765,24 @@ func usage() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 let args = CommandLine.arguments.dropFirst()
+
+// Без аргументов бандл запускает LaunchServices: двойной клик, `open -a` или
+// «Quit & Reopen» в Настройках после выдачи разрешения. launchd же всегда
+// передаёт `run`. Если служба загружена, отдаём запуск ей и выходим — иначе
+// рядом с launchd-копией поднималась вторая и обе дрались за подсветку.
+// Служба не загружена (reauthorize.sh её выгружает) — работаем сами.
+if args.isEmpty {
+    let kick = Process()
+    kick.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    kick.arguments = ["kickstart", "gui/\(getuid())/com.geforester.adaptive-brightness"]
+    kick.standardOutput = FileHandle.nullDevice
+    kick.standardError = FileHandle.nullDevice
+    if (try? kick.run()) != nil {
+        kick.waitUntilExit()
+        if kick.terminationStatus == 0 { exit(0) }
+    }
+}
+
 switch args.first ?? "run" {
 case "run":
     logToFile = true
