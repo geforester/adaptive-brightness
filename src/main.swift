@@ -1410,7 +1410,13 @@ final class ShotSampler: LumaSource, @unchecked Sendable {
     private var task: Task<Void, Never>?
     private var _suspended = false
 
-    func setSuspended(_ on: Bool) { lock.lock(); _suspended = on; lock.unlock() }
+    func setSuspended(_ on: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        // Пауза — не поломка. Без сброса тишина копилась бы всё время паузы, и
+        // после прокрутки дольше 5с демон перезапускал бы исправный съём.
+        if _suspended, !on { _lastDelivery = Date() }
+        _suspended = on
+    }
     private var suspended: Bool { lock.lock(); defer { lock.unlock() }; return _suspended }
 
     init(width: Int, height: Int, fps: Double, display: CGDirectDisplayID? = nil) {
