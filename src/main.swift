@@ -371,6 +371,24 @@ struct State {
 // Подсветка встроенного дисплея (приватный DisplayServices)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Встроенная панель — единственная, чьей подсветкой мы управляем. Не главный
+/// дисплей: главным macOS делает тот, где полоска меню, и с внешним монитором
+/// это легко оказывается он. DisplayServices на внешнем отвечает ошибкой, цикл
+/// встаёт, а буст пишет гамму и HDR-окно на чужой экран.
+/// nil — встроенной панели нет в сети (крышка закрыта).
+func builtinDisplayID() -> CGDirectDisplayID? {
+    var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+    var count: UInt32 = 0
+    guard CGGetOnlineDisplayList(UInt32(ids.count), &ids, &count) == .success else { return nil }
+    return ids.prefix(Int(count)).first { CGDisplayIsBuiltin($0) != 0 }
+}
+
+func screen(for display: CGDirectDisplayID) -> NSScreen? {
+    NSScreen.screens.first {
+        ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display
+    }
+}
+
 final class Backlight {
     private typealias GetFn = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
     private typealias SetFn = @convention(c) (CGDirectDisplayID, Float) -> Int32
@@ -428,10 +446,12 @@ final class ScreenSampler: @unchecked Sendable {
         // Фильтр кэшируем: SCShareableContent — заметно дороже самого кадра.
         if let f = filter, Date().timeIntervalSince(filterRefreshed) < 60 { return f }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() })
-                ?? content.displays.first else {
+        // Снимаем ту же панель, чьей подсветкой управляем, а не первую попавшуюся:
+        // светлота чужого экрана к этой подсветке отношения не имеет.
+        guard let id = builtinDisplayID(),
+              let display = content.displays.first(where: { $0.displayID == id }) else {
             throw NSError(domain: "adaptive-brightness", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "нет доступных дисплеев"])
+                          userInfo: [NSLocalizedDescriptionKey: "встроенного дисплея нет (крышка закрыта?)"])
         }
         let f = SCContentFilter(display: display, excludingWindows: [])
         filter = f
@@ -1205,10 +1225,7 @@ final class XDRBoost {
     /// Запас яркости, который система готова дать прямо сейчас. Больше 1.0
     /// означает, что панель в HDR-режиме.
     var headroom: Double {
-        let screen = NSScreen.screens.first {
-            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display
-        }
-        return Double(screen?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0)
+        Double(screen(for: display)?.maximumExtendedDynamicRangeColorComponentValue ?? 1.0)
     }
 
     private func captureBaseTable() -> Bool {
@@ -1247,7 +1264,8 @@ final class XDRBoost {
         w.backgroundColor = .clear
         w.ignoresMouseEvents = true
         w.contentView = EDRTriggerView(value: 1.6)
-        if let s = NSScreen.main {
+        // HDR-режим включается на том экране, где лежит окно, — значит, на нашем.
+        if let s = screen(for: display) {
             w.setFrameOrigin(CGPoint(x: s.frame.origin.x, y: s.frame.origin.y + s.frame.height - 1))
         }
         w.orderFrontRegardless()
@@ -1467,10 +1485,12 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
     func start() async throws {
         await stop()
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() })
-                ?? content.displays.first else {
+        // Снимаем ту же панель, чьей подсветкой управляем, а не первую попавшуюся:
+        // светлота чужого экрана к этой подсветке отношения не имеет.
+        guard let id = builtinDisplayID(),
+              let display = content.displays.first(where: { $0.displayID == id }) else {
             throw NSError(domain: "adaptive-brightness", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "нет доступных дисплеев"])
+                          userInfo: [NSLocalizedDescriptionKey: "встроенного дисплея нет (крышка закрыта?)"])
         }
         let cfg = SCStreamConfiguration()
         cfg.width = width
@@ -1660,7 +1680,18 @@ func screenIsUsable(_ display: CGDirectDisplayID) -> Bool {
 func runDaemon(dryRun: Bool, singleShot: Bool) async {
     ensureDirs()
     let config = Config.load()
-    let display = CGMainDisplayID()
+
+    // Крышка закрыта — управлять нечем. Ждём молча, а не выходим: выход
+    // по KeepAlive превратился бы в перезапуск раз в несколько секунд.
+    var display: CGDirectDisplayID
+    if let id = builtinDisplayID() {
+        display = id
+    } else {
+        log("встроенного дисплея нет (крышка закрыта?) — жду, пока появится")
+        while builtinDisplayID() == nil { try? await Task.sleep(nanoseconds: 2_000_000_000) }
+        display = builtinDisplayID()!
+        log("встроенный дисплей появился")
+    }
 
     guard let backlight = Backlight() else {
         log("ОШИБКА: не удалось подключиться к DisplayServices — управление подсветкой недоступно")
@@ -2011,7 +2042,19 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                        max(0, config.wakeSettle)))
         }
 
-        guard let actual = backlight.read(display) else { continue }
+        guard let actual = backlight.read(display) else {
+            // Крышку закрыли на ходу: панель ушла из сети. Не долбим
+            // DisplayServices на частоте контура, а ждём её возвращения.
+            // ID встроенной панели постоянен, но на всякий случай берём заново.
+            if CGDisplayIsOnline(display) == 0 {
+                log("встроенный дисплей пропал (крышка закрыта?) — жду, пока появится")
+                while builtinDisplayID() == nil { try? await Task.sleep(nanoseconds: 2_000_000_000) }
+                display = builtinDisplayID()!
+                log("встроенный дисплей вернулся")
+                lastTick = Date()
+            }
+            continue
+        }
         boostTick &+= 1
         var frozenByGesture = false
 
@@ -2650,7 +2693,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
 
 func runProbe() async {
     let config = Config.load()
-    let display = CGMainDisplayID()
+    guard let display = builtinDisplayID() else { print("встроенного дисплея нет (крышка закрыта?)"); exit(1) }
     guard let backlight = Backlight() else { log("нет доступа к DisplayServices"); exit(1) }
     let sampler = ScreenSampler(width: config.sampleWidth, height: config.sampleHeight)
 
@@ -2672,7 +2715,7 @@ func runProbe() async {
 
 func runStatus() async {
     let config = Config.load()
-    let display = CGMainDisplayID()
+    guard let display = builtinDisplayID() else { print("встроенного дисплея нет (крышка закрыта?)"); exit(1) }
     guard let backlight = Backlight() else { print("нет доступа к DisplayServices"); exit(1) }
     let actual = backlight.read(display) ?? -1
 
@@ -2726,7 +2769,7 @@ func runStatus() async {
 func runReset() async {
     ensureDirs()
     let config = Config.load()
-    let display = CGMainDisplayID()
+    guard let display = builtinDisplayID() else { print("встроенного дисплея нет (крышка закрыта?)"); exit(1) }
     guard let backlight = Backlight(), let actual = backlight.read(display) else {
         print("нет доступа к подсветке"); exit(1)
     }
