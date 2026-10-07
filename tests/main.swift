@@ -232,6 +232,23 @@ test("заморозка: не ведёт, клавиши работают, по
           "после заморозки светлота взята как есть: \(String(describing: s.m.smoothedLuma))")
 }
 
+test("жест: правка на светлом под заглушенным съёмом не уходит в тёмную точку") {
+    // 22:08:24: рука на трекпаде, жмут «ярче» на светлом экране; жест
+    // отпустили уже на тёмном окне — правку клали в тёмную точку.
+    var s = Sim(model(written: 0.7))
+    s.run(4, luma: lightLuma)
+    check(near(s.m.written, 0.4), "на светлом стоим на 40%")
+    s.run(0.1, luma: lightLuma, frozen: true)
+    _ = s.keys(+2)
+    s.run(1, luma: lightLuma, frozen: true)
+    s.clear()
+    s.run(3, luma: darkLuma)
+    check(s.calibrations.count == 1 && s.calibrations[0].0 == .light, "зона светлая: \(s.calibrations)")
+    check(near(s.m.light, 0.525), "светлая точка = 52.5%: \(s.m.light)")
+    check(near(s.m.dark, 0.7), "тёмная не тронута: \(s.m.dark)")
+    check(near(s.m.written, 0.7), "на тёмном окне ведёт к тёмной точке: \(s.m.written)")
+}
+
 test("без кадров: не ведёт и не выдумывает светлоту") {
     var s = Sim(model(written: 0.4))
     s.run(2, luma: nil)

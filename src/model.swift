@@ -118,8 +118,14 @@ struct ExternalModel {
     private(set) var keySeries = false
     private var keySeriesFrom = 0.0
     private var keyLastAt = 0.0
+    /// Светлота в момент первого нажатия и был ли за серию заглушен съём.
+    /// Если был — к закрытию серии на экране бывает уже другое окно, и зону
+    /// правки решаем по тому, что было, когда жали клавиши.
+    private var keySeriesLuma: Double?
+    private var keySeriesFrozen = false
 
     private var pendingManual: Double?
+    private var pendingZoneLuma: Double?
     private var settlingUntil = 0.0
     private var wasFrozen = false
 
@@ -152,6 +158,8 @@ struct ExternalModel {
         if !keySeries {
             keySeries = true
             keySeriesFrom = written
+            keySeriesLuma = smoothedLuma
+            keySeriesFrozen = wasFrozen
         }
         keyLastAt = now
         halt()
@@ -193,10 +201,11 @@ struct ExternalModel {
         var out = Output()
 
         if keySeries {
+            if frozen { keySeriesFrozen = true }
             guard now - keyLastAt >= p.keySettle else { return out }
             keySeries = false
             if abs(written - keySeriesFrom) > 1e-6 {
-                acceptManual(now: now)
+                acceptManual(now: now, zoneLuma: keySeriesFrozen ? keySeriesLuma : nil)
                 out.events.append(.manual(written))
             }
         }
@@ -225,11 +234,15 @@ struct ExternalModel {
         // Правку относим к зоне, только когда светлота устоялась: сразу после
         // переключения окна сглаженная ещё едет к настоящей.
         if let value = pendingManual {
-            let settled = luma.map { abs($0 - smoothed) <= p.lumaSettleEps } ?? false
-            guard settled || now >= settlingUntil else { return out }
+            let zl = pendingZoneLuma ?? smoothed
+            if pendingZoneLuma == nil {
+                let settled = luma.map { abs($0 - smoothed) <= p.lumaSettleEps } ?? false
+                guard settled || now >= settlingUntil else { return out }
+            }
             pendingManual = nil
-            holdLuma = smoothed
-            let c = calibratePoints(value: value, n: normalized(smoothed), dark: dark, light: light,
+            pendingZoneLuma = nil
+            holdLuma = zl
+            let c = calibratePoints(value: value, n: normalized(zl), dark: dark, light: light,
                               edge: p.calibrateEdge, min: p.minBrightness, max: p.maxBrightness)
             dark = c.dark
             light = c.light
@@ -276,11 +289,12 @@ struct ExternalModel {
         return out
     }
 
-    private mutating func acceptManual(now: Double) {
+    private mutating func acceptManual(now: Double, zoneLuma: Double?) {
         halt()
         current = written
-        holdLuma = smoothedLuma
+        holdLuma = zoneLuma ?? smoothedLuma
         pendingManual = written
+        pendingZoneLuma = zoneLuma
         settlingUntil = now + max(0, p.lumaSettleMax)
     }
 }

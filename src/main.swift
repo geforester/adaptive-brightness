@@ -2379,6 +2379,13 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     var keysSeriesActual = 0.0
     var keysSeriesStill = Date()
     var keysSeriesStart = Date()
+    /// Светлота в момент первого нажатия серии и был ли за серию жест. Рука
+    /// на трекпаде глушит съём, серия закрывается только после жеста, и к
+    /// тому времени на экране бывает уже другое окно: правку, сделанную на
+    /// светлом, демон клал в тёмную точку. Если съём глушился, зону решаем по
+    /// тому, что было на экране, когда жали клавиши.
+    var keysSeriesLuma: Double? = nil
+    var keysSeriesFrozen = false
 
     // Светлота после правки ещё не установилась: сглаженная догоняет сырую.
     // Пока догоняет, точка отсчёта дописывается свежей светлотой.
@@ -2434,11 +2441,24 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     /// или светлый) определяется по светлоте, а сразу после переключения окна
     /// она ещё едет к настоящей. Одна дорога для клавиш, Control Center и
     /// системного датчика.
-    func acceptManual(_ value: Double) {
+    ///
+    /// `zoneLuma` — светлота, по которой решать зону сразу, без ожидания:
+    /// правка делалась при заглушенном съёме, и нынешняя светлота к ней
+    /// отношения не имеет.
+    func acceptManual(_ value: Double, zoneLuma: Double? = nil) {
         velocity = 0
         current = value
         moveFrom = nil
         state.lastWritten = value
+        if let l = zoneLuma {
+            holding = true
+            holdLuma = l
+            state.holdLuma = l
+            pendingManual = nil
+            lumaSettling = false
+            calibrate(value, luma: l)
+            return
+        }
         holding = true
         holdLuma = smoothedLuma
         state.holdLuma = smoothedLuma
@@ -2456,20 +2476,21 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     /// значение при текущей светлоте: выставил 60% — 60% и останется, а не
     /// «почти 60, демон чуть подвинет». На краю шкалы это почти тождество, к
     /// середине пересчёт усиливается — потому середина в точки и не пишется.
-    func calibrate(_ value: Double) {
+    func calibrate(_ value: Double, luma: Double? = nil) {
+        let zl = luma ?? smoothedLuma
         // Ноль — это не «очень тускло», а «экран погашен». В точку его класть
         // нельзя: граница minBrightness подняла бы его до 15%, и демон тут же
         // зажёг бы экран обратно, а светлая точка уехала бы следом за тёмной.
         // Держим погашенным, пока человек сам не поднимет яркость.
         if value <= screenOffLevel {
             holding = true
-            state.holdLuma = smoothedLuma
+            state.holdLuma = zl
             log("экран погашен руками — точки не трогаю, не зажгу, пока не поднимешь яркость сам")
             state.save()
             liveState.set(state)
             return
         }
-        let n = normalizedLuma(smoothedLuma, config)
+        let n = normalizedLuma(zl, config)
         let waited = Date().timeIntervalSince(pendingManualAt)
         let delay = (config.traceEvents || config.traceKeys) && waited < 60
             ? String(format: "  [ждал зоны %.2fс]", waited) : ""
@@ -2486,7 +2507,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 ? String(format: "светлый был выше (%@) — подтянул туда же, кривая пока плоская", pct(wasLight))
                 : String(format: "светлый остаётся %@", pct(state.light))
             log(String(format: "тёмный экран → %@ (светлота %.3f, norm %.2f); %@%@",
-                       pct(state.dark), smoothedLuma, n, tail, delay))
+                       pct(state.dark), zl, n, tail, delay))
         case .light:
             let wasDark = state.dark
             state.dark = c.dark
@@ -2497,12 +2518,12 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 ? String(format: "тёмный был ниже (%@) — поднял туда же, кривая пока плоская", pct(wasDark))
                 : String(format: "тёмный остаётся %@", pct(state.dark))
             log(String(format: "светлый экран → %@ (светлота %.3f, norm %.2f); %@%@",
-                       pct(state.light), smoothedLuma, n, tail, delay))
+                       pct(state.light), zl, n, tail, delay))
         case .middle:
             // Серединка: ни туда ни сюда. Точки не трогаем — держим выставленное
             // до смены контента, как держали бы любую разовую правку.
             log(String(format: "правка на %@ при светлоте %.3f (norm %.2f) — это середина, точки не трогаю, держу до смены контента%@",
-                       pct(value), smoothedLuma, n, delay))
+                       pct(value), zl, n, delay))
         }
         state.save()
         liveState.set(state)
@@ -2560,6 +2581,8 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 keysSeriesActual = actual
                 keysSeriesStill = Date()
                 keysSeriesStart = Date()
+                keysSeriesLuma = sampler.luma ?? smoothedLuma
+                keysSeriesFrozen = false
             }
             if keysSeries, abs(actual - keysSeriesActual) > 1e-4 {
                 // Подсветка ещё едет — рамп системы не закончен.
@@ -2586,6 +2609,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 // цикл не доходил ни до выключателя, ни до клавиш, ни до буста.
                 // Глушим только съём и ведение, всё остальное работает.
                 frozenByGesture = true
+                if keysSeries { keysSeriesFrozen = true }
             } else if gestureSuspended {
                 gestureSuspended = false
                 sampler.setSuspended(false)
@@ -3071,7 +3095,7 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
 
             keysSeries = false
             if !dryRun, abs(actual - keysSeriesWritten) > config.manualEpsilon {
-                acceptManual(actual)
+                acceptManual(actual, zoneLuma: keysSeriesFrozen ? keysSeriesLuma : nil)
                 continue
             }
             // Ничего не изменилось: упёрлись в край шкалы или нажатие ушло
