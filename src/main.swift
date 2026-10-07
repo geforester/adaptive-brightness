@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import MetalKit
 import CoreGraphics
+import IOKit
 import CoreMedia
 import CoreVideo
 import ScreenCaptureKit
@@ -175,6 +176,15 @@ struct Config {
     /// доступен только через `adaptive-brightness boost`.
     var nativeKeysBoost = true
 
+    /// Подстраивать и внешние мониторы — по DDC/CI. Клавиши яркости с курсором
+    /// на мониторе правят его, а не встроенную панель.
+    var externalDisplays = true
+    /// Пауза между DDC-записями, сек. Ход идёт по одной единице шкалы монитора
+    /// за запись, так что это и темп: 0.02 — 30 единиц за 0.6с. Замерено на
+    /// Dell P2415Q: записи подряд без пауз он тоже принимает без ошибок, но
+    /// на глаз приятнее всего 20 мс.
+    var ddcStepInterval: Double = 0.02
+
     /// Потолок буста на XDR-панели. 1.0 — буст запрещён, 1.6 ≈ «160%».
     /// Выше запаса EDR смысла поднимать нет: значения всё равно обрежутся.
     var maxBoost: Double = 1.6
@@ -255,6 +265,8 @@ struct Config {
         c.wakeSettle      = d("wakeSettle", c.wakeSettle)
         c.maxBoost        = d("maxBoost", c.maxBoost)
         c.nativeKeysBoost = (raw["nativeKeysBoost"] as? NSNumber)?.boolValue ?? c.nativeKeysBoost
+        c.externalDisplays = (raw["externalDisplays"] as? NSNumber)?.boolValue ?? c.externalDisplays
+        c.ddcStepInterval = d("ddcStepInterval", c.ddcStepInterval)
         c.chordHold       = d("chordHold", c.chordHold)
         c.keySettle       = d("keySettle", c.keySettle)
         c.keyStill        = d("keyStill", c.keyStill)
@@ -323,7 +335,7 @@ struct State {
         return s
     }
 
-    func save() {
+    func save(to url: URL = stateURL) {
         // Инвариант держим и на записи: в файл не должна попасть перевёрнутая
         // пара, даже если кто-то соберёт State мимо `normalized()`. Заодно
         // это чинит покорёженный руками state.json на первой же записи демона:
@@ -337,11 +349,11 @@ struct State {
         obj["enabled"] = s.enabled
         if let h = s.holdLuma { obj["holdLuma"] = h }
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) else { return }
-        try? data.write(to: stateURL, options: .atomic)
+        try? data.write(to: url, options: .atomic)
     }
 
-    static func load(_ c: Config = Config.load()) -> State? {
-        guard let data = try? Data(contentsOf: stateURL),
+    static func load(_ c: Config = Config.load(), from url: URL = stateURL) -> State? {
+        guard let data = try? Data(contentsOf: url),
               let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
         let h = (raw["holdLuma"] as? NSNumber)?.doubleValue
@@ -432,8 +444,11 @@ final class ScreenSampler: @unchecked Sendable {
     private let config: SCStreamConfiguration
     private var filter: SCContentFilter?
     private var filterRefreshed = Date.distantPast
+    /// Какой экран снимать; nil — встроенный.
+    private let display: CGDirectDisplayID?
 
-    init(width: Int, height: Int) {
+    init(width: Int, height: Int, display: CGDirectDisplayID? = nil) {
+        self.display = display
         let c = SCStreamConfiguration()
         c.width = width
         c.height = height
@@ -448,10 +463,11 @@ final class ScreenSampler: @unchecked Sendable {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         // Снимаем ту же панель, чьей подсветкой управляем, а не первую попавшуюся:
         // светлота чужого экрана к этой подсветке отношения не имеет.
-        guard let id = builtinDisplayID(),
+        guard let id = self.display ?? builtinDisplayID(),
               let display = content.displays.first(where: { $0.displayID == id }) else {
             throw NSError(domain: "adaptive-brightness", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "встроенного дисплея нет (крышка закрыта?)"])
+                          userInfo: [NSLocalizedDescriptionKey: self.display == nil
+                              ? "встроенного дисплея нет (крышка закрыта?)" : "дисплея \(self.display!) нет"])
         }
         let f = SCContentFilter(display: display, excludingWindows: [])
         filter = f
@@ -904,6 +920,19 @@ final class KeyPassState: @unchecked Sendable {
     private let lock = NSLock()
     private var swallowedUpKey = false
     private var swallowedDownKey = false
+    private var externalUpKey = false
+    private var externalDownKey = false
+
+    /// Нажатие ушло внешнему монитору — отпускание идёт туда же, а не панели.
+    func recordExternal(up: Bool, _ ext: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if up { externalUpKey = ext } else { externalDownKey = ext }
+    }
+
+    func wentExternal(up: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return up ? externalUpKey : externalDownKey
+    }
 
     func recordDown(up: Bool, swallowed: Bool) {
         lock.lock(); defer { lock.unlock() }
@@ -1061,9 +1090,17 @@ private let brightnessTapCallback: CGEventTapCallBack = { _, type, event, _ in
     let isUp = keyCode == nxKeyBrightnessUp
     let keyDown = ((ns.data1 & 0x0000_FF00) >> 8) == 0x0A
 
+    // Курсор на внешнем мониторе, которым управляем мы, — клавиши его. Решаем
+    // по нажатию, отпускание повторяет решение: курсор мог уехать между ними.
+    let external: CGDirectDisplayID? = keyDown ? externalRoute.underCursor() : nil
+    if keyDown { keyPassState.recordExternal(up: isUp, external != nil) }
+    let toExternal = keyDown ? external != nil : keyPassState.wentExternal(up: isUp)
+
     // Отмечаем и нажатие, и отпускание, и автоповтор, и те события, что уйдут
     // в систему нетронутыми: контуру важен сам факт, что рука на яркости.
-    keysClock.touch()
+    // Кроме клавиш внешнего монитора: панель они не трогают, и открывать на
+    // ней ручную серию — значит зря останавливать её ход.
+    if !toExternal { keysClock.touch() }
 
     chordState.note(up: isUp, isDown: keyDown, window: 0.4)
 
@@ -1073,6 +1110,13 @@ private let brightnessTapCallback: CGEventTapCallBack = { _, type, event, _ in
         let sw = keyPassState.swallowedDown(up: isUp)
         keyTrace.add("\(isUp ? "ЯРЧЕ " : "ТУСКЛ") ↑  \(sw ? "глотаю" : "пропускаю")  аккорд=\(chordState.held ? "да" : "нет")")
         return sw ? nil : Unmanaged.passUnretained(event)
+    }
+
+    if let ext = external {
+        keyPassState.recordDown(up: isUp, swallowed: true)
+        keyTrace.add("\(isUp ? "ЯРЧЕ " : "ТУСКЛ") ↓  монитору \(ext)  аккорд=\(chordState.held ? "да" : "нет")")
+        if !chordState.held { externalRoute.add(ext, isUp ? 1 : -1) }
+        return nil
     }
 
     let swallow = chordState.held || tapState.shouldSwallow(up: isUp)
@@ -1369,8 +1413,8 @@ final class ShotSampler: LumaSource, @unchecked Sendable {
     func setSuspended(_ on: Bool) { lock.lock(); _suspended = on; lock.unlock() }
     private var suspended: Bool { lock.lock(); defer { lock.unlock() }; return _suspended }
 
-    init(width: Int, height: Int, fps: Double) {
-        shooter = ScreenSampler(width: width, height: height)
+    init(width: Int, height: Int, fps: Double, display: CGDirectDisplayID? = nil) {
+        shooter = ScreenSampler(width: width, height: height, display: display)
         interval = 1.0 / max(0.1, fps)
     }
 
@@ -1445,6 +1489,8 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
     private let width: Int
     private let height: Int
     private let fps: Double
+    /// Какой экран снимать; nil — встроенный.
+    private let display: CGDirectDisplayID?
 
     private let lock = NSLock()
     private var _luma: Double?
@@ -1456,7 +1502,8 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
     private let queue = DispatchQueue(label: "com.geforester.adaptive-brightness.capture",
                                       qos: .userInitiated)
 
-    init(width: Int, height: Int, fps: Double) {
+    init(width: Int, height: Int, fps: Double, display: CGDirectDisplayID? = nil) {
+        self.display = display
         self.width = width
         self.height = height
         self.fps = max(1, fps)
@@ -1487,10 +1534,11 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         // Снимаем ту же панель, чьей подсветкой управляем, а не первую попавшуюся:
         // светлота чужого экрана к этой подсветке отношения не имеет.
-        guard let id = builtinDisplayID(),
+        guard let id = self.display ?? builtinDisplayID(),
               let display = content.displays.first(where: { $0.displayID == id }) else {
             throw NSError(domain: "adaptive-brightness", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "встроенного дисплея нет (крышка закрыта?)"])
+                          userInfo: [NSLocalizedDescriptionKey: self.display == nil
+                              ? "встроенного дисплея нет (крышка закрыта?)" : "дисплея \(self.display!) нет"])
         }
         let cfg = SCStreamConfiguration()
         cfg.width = width
@@ -1587,8 +1635,7 @@ let liveState = StateBox()
 // ─────────────────────────────────────────────────────────────────────────────
 
 func normalizedLuma(_ luma: Double, _ c: Config) -> Double {
-    let span = max(1e-6, c.lightPoint - c.darkPoint)
-    return max(0, min(1, (luma - c.darkPoint) / span))
+    normalizedLuma(luma, darkPoint: c.darkPoint, lightPoint: c.lightPoint)
 }
 
 /// Яркость между двумя выставленными концами: `dark` на тёмном экране, `light`
@@ -1599,11 +1646,8 @@ func normalizedLuma(_ luma: Double, _ c: Config) -> Double {
 /// Формула совпадает с прежней при `span = light / dark`, так что контур,
 /// пружина и пороги остались прежними.
 func targetBrightness(luma: Double, state: State, config c: Config) -> Double {
-    let now = normalizedLuma(luma, c)
-    let dark = max(1e-4, state.dark)
-    let light = max(1e-4, state.light)
-    let target = dark * pow(light / dark, now)
-    return max(c.minBrightness, min(c.maxBrightness, target))
+    interpolatedBrightness(n: normalizedLuma(luma, c), dark: state.dark, light: state.light,
+                           min: c.minBrightness, max: c.maxBrightness)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1659,7 +1703,434 @@ func log(_ message: String) {
     }
 }
 
-func pct(_ v: Double) -> String { String(format: "%.0f%%", v * 100) }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Внешние мониторы: DDC/CI
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Подсветку внешнего монитора DisplayServices не видит — у него она своя, и
+// управляется она командами по DDC/CI через тот же кабель. На Apple Silicon
+// это приватный IOAVService; так же делает MonitorControl (Arm64DDC.swift).
+
+typealias IOAVService = CFTypeRef
+@_silgen_name("IOAVServiceCreateWithService")
+func IOAVServiceCreateWithService(_ allocator: CFAllocator?, _ service: io_service_t) -> Unmanaged<IOAVService>?
+@_silgen_name("IOAVServiceWriteI2C")
+func IOAVServiceWriteI2C(_ service: IOAVService, _ chip: UInt32, _ address: UInt32,
+                         _ buffer: UnsafeMutableRawPointer, _ length: UInt32) -> IOReturn
+
+private let ddcChip: UInt32 = 0x37
+private let ddcData: UInt32 = 0x51
+private let vcpBrightness: UInt8 = 0x10
+
+/// DDC-порт внешнего монитора и то, по чему его узнать среди дисплеев CG.
+struct DDCPort {
+    let service: IOAVService
+    let vendor: UInt32
+    let model: UInt32
+    let serial: UInt32
+    let name: String
+
+    /// Ключ для файла состояния: тот же монитор на другом порту — тот же ключ.
+    var key: String { "\(vendor)-\(model)-\(serial)" }
+
+    func matches(_ id: CGDirectDisplayID) -> Bool {
+        CGDisplayVendorNumber(id) == vendor && CGDisplayModelNumber(id) == model
+            && CGDisplaySerialNumber(id) == serial
+    }
+
+    /// Запись VCP. Чтение не делаем: Dell P2415Q отвечает на него нулями, а
+    /// без чтения логика целиком держится на записанном нами.
+    func write(_ code: UInt8, _ value: Int) -> Bool {
+        let send: [UInt8] = [code, UInt8((value >> 8) & 0xFF), UInt8(value & 0xFF)]
+        var packet: [UInt8] = [UInt8(0x80 | (send.count + 1)), UInt8(send.count)] + send + [0]
+        var chk = UInt8(ddcChip << 1) ^ UInt8(ddcData)
+        for b in packet.dropLast() { chk ^= b }
+        packet[packet.count - 1] = chk
+        return IOAVServiceWriteI2C(service, ddcChip, ddcData, &packet, UInt32(packet.count)) == 0
+    }
+}
+
+/// Все внешние DDC-порты. В реестре кадровый буфер (AppleCLCD2) идёт перед
+/// своим DCPAVServiceProxy, поэтому атрибуты дисплея берём у последнего
+/// встреченного буфера — тот же обход, что у MonitorControl.
+func ddcPorts() -> [DDCPort] {
+    let root = IORegistryGetRootEntry(kIOMainPortDefault)
+    defer { IOObjectRelease(root) }
+    var it = io_iterator_t()
+    guard IORegistryEntryCreateIterator(root, kIOServicePlane, IOOptionBits(kIORegistryIterateRecursively),
+                                        &it) == KERN_SUCCESS else { return [] }
+    defer { IOObjectRelease(it) }
+
+    var attrs: [String: Any]? = nil
+    var out: [DDCPort] = []
+    while case let entry = IOIteratorNext(it), entry != 0 {
+        defer { IOObjectRelease(entry) }
+        var buf = [CChar](repeating: 0, count: 128)
+        IORegistryEntryGetName(entry, &buf)
+        let name = String(cString: buf)
+        func prop(_ k: String) -> Any? {
+            IORegistryEntryCreateCFProperty(entry, k as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+        }
+        if name == "AppleCLCD2" || name == "IOMobileFramebufferShim" {
+            attrs = (prop("DisplayAttributes") as? [String: Any])?["ProductAttributes"] as? [String: Any]
+        } else if name == "DCPAVServiceProxy" {
+            guard prop("Location") as? String == "External", let a = attrs,
+                  let svc = IOAVServiceCreateWithService(kCFAllocatorDefault, entry)?.takeRetainedValue()
+            else { continue }
+            out.append(DDCPort(service: svc,
+                               vendor: (a["LegacyManufacturerID"] as? NSNumber)?.uint32Value ?? 0,
+                               model: (a["ProductID"] as? NSNumber)?.uint32Value ?? 0,
+                               serial: (a["SerialNumber"] as? NSNumber)?.uint32Value ?? 0,
+                               name: (a["ProductName"] as? String) ?? "монитор"))
+        }
+    }
+    return out
+}
+
+/// Пишет яркость в отдельном потоке: запись стоит ~5 мс, изредка до 100, и
+/// контуру ждать её незачем. Цель можно менять когда угодно — поток идёт к
+/// последней по одной единице шкалы за запись (`nextDDCValue`).
+final class DDCWriter: @unchecked Sendable {
+    private let port: DDCPort
+    private let interval: TimeInterval
+    private let cond = NSCondition()
+    private var target: Int?
+    private var sent: Int?
+    private var stopped = false
+    private var failed = false
+
+    init(port: DDCPort, interval: TimeInterval) {
+        self.port = port
+        self.interval = max(0, interval)
+        let t = Thread { [weak self] in self?.run() }
+        t.name = "ddc-\(port.key)"
+        t.qualityOfService = .userInitiated
+        t.start()
+    }
+
+    func set(_ value: Int) {
+        cond.lock(); target = value; cond.signal(); cond.unlock()
+    }
+
+    func stop() {
+        cond.lock(); stopped = true; cond.signal(); cond.unlock()
+    }
+
+    /// true один раз после первой неудачной записи серии — для лога.
+    func takeFailed() -> Bool {
+        cond.lock(); defer { cond.unlock() }
+        let f = failed; failed = false; return f
+    }
+
+    private func run() {
+        while true {
+            cond.lock()
+            while !stopped, target.flatMap({ nextDDCValue(sent: sent, target: $0) }) == nil { cond.wait() }
+            if stopped { cond.unlock(); return }
+            let next = nextDDCValue(sent: sent, target: target!)!
+            cond.unlock()
+
+            let ok = port.write(vcpBrightness, next)
+            cond.lock()
+            if ok { sent = next } else { failed = true }
+            cond.unlock()
+            // На неудаче не молотим: монитор мог уйти в сон или отключиться.
+            Thread.sleep(forTimeInterval: ok ? interval : 0.5)
+        }
+    }
+}
+
+/// Куда идут клавиши яркости: монитор под курсором, если им управляем мы.
+/// Читается из обработчика event tap — отсюда лок и никакой работы сверх
+/// поиска дисплея по точке.
+final class ExternalRoute: @unchecked Sendable {
+    private let lock = NSLock()
+    private var displays = Set<CGDirectDisplayID>()
+    private var steps: [CGDirectDisplayID: Int] = [:]
+
+    func setDisplays(_ ids: Set<CGDirectDisplayID>) {
+        lock.lock(); displays = ids; steps = steps.filter { ids.contains($0.key) }; lock.unlock()
+    }
+
+    /// Монитор под курсором, если он наш; nil — клавиши идут встроенной панели.
+    func underCursor() -> CGDirectDisplayID? {
+        guard let point = CGEvent(source: nil)?.location else { return nil }
+        var id: CGDirectDisplayID = 0
+        var count: UInt32 = 0
+        guard CGGetDisplaysWithPoint(point, 1, &id, &count) == .success, count > 0 else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return displays.contains(id) ? id : nil
+    }
+
+    func add(_ id: CGDirectDisplayID, _ n: Int) { lock.lock(); steps[id, default: 0] += n; lock.unlock() }
+    func take(_ id: CGDirectDisplayID) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return steps.removeValue(forKey: id) ?? 0
+    }
+}
+let externalRoute = ExternalRoute()
+
+func externalStateURL(_ key: String) -> URL {
+    stateDir.appendingPathComponent("external-\(key).json")
+}
+
+/// Один внешний монитор: модель, съём его экрана и DDC.
+@MainActor
+final class ExternalController {
+    let display: CGDirectDisplayID
+    let port: DDCPort
+    private let config: Config
+    private var model: ExternalModel
+    private let writer: DDCWriter
+    private let sampler: LumaSource
+    private var capturing = false
+    private var suspended = false
+    private var captureDown = false
+    private var lastRestart = Date.distantPast
+    private var firstFrameLogged = false
+
+    init(display: CGDirectDisplayID, port: DDCPort, config: Config) {
+        self.display = display
+        self.port = port
+        self.config = config
+        var p = ExternalParams()
+        p.darkPoint = config.darkPoint
+        p.lightPoint = config.lightPoint
+        p.minBrightness = config.minBrightness
+        p.maxBrightness = config.maxBrightness
+        p.travelTime = config.travelTime
+        p.tauLuma = config.tauLuma
+        p.resumeLumaDelta = config.resumeLumaDelta
+        p.calibrateEdge = config.calibrateEdge
+        p.startThreshold = config.startThreshold
+        p.stopThreshold = config.stopThreshold
+        p.keySettle = config.keySettle
+        p.lumaSettleEps = config.lumaSettleEps
+        p.lumaSettleMax = config.lumaSettleMax
+
+        if let data = try? Data(contentsOf: externalStateURL(port.key)),
+           let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let d = (raw["dark"] as? NSNumber)?.doubleValue,
+           let l = (raw["light"] as? NSNumber)?.doubleValue {
+            let w = (raw["lastWritten"] as? NSNumber)?.doubleValue ?? d
+            model = ExternalModel(params: p, dark: d, light: max(0, min(d, l)), written: w,
+                                  holdLuma: (raw["holdLuma"] as? NSNumber)?.doubleValue)
+        } else {
+            // Первая встреча с монитором. Что на нём стоит, не прочитать, так
+            // что начинаем с точек встроенной панели — вкус у человека один, а
+            // первая же правка клавишами заменит свою точку настоящей.
+            let b = liveState.snapshot() ?? State.load()
+            let d = b?.dark ?? 0.7, l = b?.light ?? 0.5
+            model = ExternalModel(params: p, dark: d, light: l, written: d, holdLuma: nil)
+        }
+        writer = DDCWriter(port: port, interval: config.ddcStepInterval)
+        sampler = config.captureMode.lowercased() == "stream"
+            ? LiveSampler(width: config.sampleWidth, height: config.sampleHeight, fps: config.captureHz, display: display)
+            : ShotSampler(width: config.sampleWidth, height: config.sampleHeight, fps: config.captureHz, display: display)
+    }
+
+    private func say(_ s: String) { log("[\(port.name)] \(s)") }
+
+    func start() {
+        // Что стоит на мониторе, мы не знаем: его могли крутить кнопками или
+        // другой программой. Приводим к тому, что считаем стоящим, — иначе
+        // первый ход поехал бы от выдуманной точки.
+        writer.set(ddcValue(model.written, max: 100))
+        say(String(format: "под управлением (DDC): тёмный %@, светлый %@, выставляю %@",
+                   pct(model.dark), pct(model.light), pct(model.written)))
+    }
+
+    func stop() async {
+        writer.stop()
+        await sampler.stop()
+        save()
+    }
+
+    private func save() {
+        var obj: [String: Any] = ["name": port.name, "dark": model.dark, "light": model.light,
+                                  "lastWritten": model.written]
+        if let h = model.holdLuma { obj["holdLuma"] = h }
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) else { return }
+        try? data.write(to: externalStateURL(port.key), options: .atomic)
+    }
+
+    /// - `active`: вести можно — экран не спит, адаптация включена, не пауза.
+    /// - `transition`: идёт жест или смена стола — съём глушим, как и на панели.
+    func tick(now: Double, dt: Double, active: Bool, transition: Bool, chordHeld: Bool) async {
+        // ── Клавиши ──────────────────────────────────────────────────────────
+        let steps = externalRoute.take(display)
+        if chordHeld {
+            if let back = model.cancelKeys() {
+                writer.set(ddcValue(back, max: 100))
+                say("аккорд — нажатия на мониторе не в счёт, вернул \(pct(back))")
+            }
+        } else if steps != 0 {
+            let v = model.keys(steps, now: now)
+            writer.set(ddcValue(v, max: 100))
+            if config.traceKeys || config.traceEvents { say("  [клавиши] \(steps > 0 ? "+" : "")\(steps) → \(pct(v))") }
+        }
+
+        // ── Съём ─────────────────────────────────────────────────────────────
+        if active != capturing {
+            capturing = active
+            if active {
+                do { try await sampler.start() } catch { say("съём не поднялся (\(error.localizedDescription))") }
+            } else {
+                await sampler.stop()
+            }
+        }
+        if transition != suspended {
+            suspended = transition
+            sampler.setSuspended(transition)
+        }
+        if capturing, !suspended {
+            let failure = sampler.takeFailure()
+            if failure != nil || sampler.silence > 5 {
+                if !captureDown { captureDown = true; say("съём встал (\(failure ?? "кадров нет больше 5с")) — перезапускаю") }
+                if Date().timeIntervalSince(lastRestart) > 5 {
+                    lastRestart = Date()
+                    try? await sampler.start()
+                }
+            } else if captureDown {
+                captureDown = false
+                say("съём восстановлен")
+            }
+        }
+
+        if capturing, !firstFrameLogged, let l = sampler.luma {
+            firstFrameLogged = true
+            say(String(format: "съём пошёл, светлота %.3f (norm %.2f), цель %@",
+                       l, model.normalized(l), pct(model.target(l))))
+        }
+
+        // ── Модель ───────────────────────────────────────────────────────────
+        let frozen = !active || transition || captureDown
+        let out = model.tick(now: now, dt: dt, luma: capturing ? sampler.luma : nil, frozen: frozen)
+        if let w = out.write { writer.set(ddcValue(w, max: 100)) }
+        if writer.takeFailed() { say("DDC-запись не прошла — монитор спит или отключается?") }
+
+        for e in out.events {
+            switch e {
+            case .manual(let v):
+                say("клавиши → \(pct(v)), жду устоявшуюся светлоту, чтобы понять, чья это точка")
+            case .calibrated(let zone, let d, let l, let crossed):
+                let n = model.smoothedLuma.map { String(format: "%.3f", $0) } ?? "?"
+                switch zone {
+                case .dark:   say("тёмный экран → \(pct(d)) (светлота \(n)); светлый \(crossed ? "подтянут туда же" : "остаётся \(pct(l))")")
+                case .light:  say("светлый экран → \(pct(l)) (светлота \(n)); тёмный \(crossed ? "поднят туда же" : "остаётся \(pct(d))")")
+                case .middle: say("правка на \(pct(model.written)) при светлоте \(n) — середина, точки не трогаю, держу до смены контента")
+                }
+                save()
+            case .resumed(let from, let to):
+                say(String(format: "контент сменился (norm %.2f → %.2f) → снова веду", from, to))
+                save()
+            case .moved(let from, let to, let secs):
+                let n = model.smoothedLuma.map { String(format: "%.3f", $0) } ?? "?"
+                say(String(format: "luma=%@  вёл %@ → %@, %.1fс", n, pct(from), pct(to), secs))
+                save()
+            }
+        }
+    }
+}
+
+/// Ведёт все внешние мониторы. Своя задача, а не часть контура панели: тот
+/// умеет надолго задуматься (ждёт открытия крышки, выходит из буста), а
+/// с закрытой крышкой внешние мониторы — как раз всё, что есть.
+@MainActor
+func runExternals(_ config: Config, keyTap: BrightnessKeyTap) async {
+    var controllers: [CGDirectDisplayID: ExternalController] = [:]
+    var unsupported = Set<CGDirectDisplayID>()
+    var lastScan = Date.distantPast
+    let spaceWatch = SpaceWatch()
+    var lastSpace = spaceWatch.current()
+    var spaceUntil = Date.distantPast
+    let gameMode = GameModeWatch()
+    var paused = false
+    var tick = 0
+    let dt = 1.0 / 60
+    var lastTick = Date()
+
+    while true {
+        try? await Task.sleep(nanoseconds: UInt64(dt * 1_000_000_000))
+        let now = Date()
+        let realDt = min(max(now.timeIntervalSince(lastTick), dt * 0.25), 0.1)
+        lastTick = now
+        tick &+= 1
+
+        // Подключение и отключение мониторов. Опрос, а не колбэк
+        // реконфигурации: раз в 3с хватает с запасом, а колбэк приходит
+        // посреди перестройки, когда реестр ещё не дособран.
+        if now.timeIntervalSince(lastScan) > 3 {
+            lastScan = now
+            var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+            var count: UInt32 = 0
+            CGGetOnlineDisplayList(UInt32(ids.count), &ids, &count)
+            let online = Set(ids.prefix(Int(count)).filter { CGDisplayIsBuiltin($0) == 0 })
+
+            for (id, c) in controllers where !online.contains(id) {
+                log("[\(c.port.name)] отключён")
+                await c.stop()
+                controllers[id] = nil
+            }
+            unsupported.formIntersection(online)
+            let fresh = online.subtracting(controllers.keys).subtracting(unsupported)
+            if !fresh.isEmpty {
+                let ports = ddcPorts()
+                for id in fresh {
+                    let hits = ports.filter { $0.matches(id) }
+                    guard hits.count == 1, CGDisplayMirrorsDisplay(id) == kCGNullDirectDisplay else {
+                        unsupported.insert(id)
+                        log(hits.isEmpty
+                            ? "дисплей \(id): DDC-порта нет (Apple-дисплей, AirPlay или адаптер без DDC) — не управляю"
+                            : hits.count > 1 ? "дисплей \(id): несколько одинаковых мониторов без серийника — не различаю, не управляю"
+                            : "дисплей \(id): зеркало — не управляю")
+                        continue
+                    }
+                    let c = ExternalController(display: id, port: hits[0], config: config)
+                    controllers[id] = c
+                    c.start()
+                }
+            }
+            externalRoute.setDisplays(Set(controllers.keys))
+        }
+        guard !controllers.isEmpty else { continue }
+        if tick % 60 == 0 { keyTap.ensureRunning() }
+
+        // ── Когда не вести ───────────────────────────────────────────────────
+        let enabled = EnableChannel.read() ?? liveState.snapshot()?.enabled ?? true
+        if tick % 30 == 0 {
+            var reason = ""
+            if config.pauseOnGameMode && gameMode.active {
+                reason = "Game Mode"
+            } else if let front = frontmostBundleID(),
+                      config.pauseApps.contains(where: { !$0.isEmpty && front.hasPrefix($0) }) {
+                reason = front
+            }
+            if reason.isEmpty == paused {
+                paused = !reason.isEmpty
+                log(paused ? "внешние мониторы: пауза (\(reason))" : "внешние мониторы: пауза снята")
+            }
+        }
+        let gesture = config.gestureSettle > 0 && gestureClock.secondsSince() < config.gestureSettle
+        if config.spaceSettle > 0, spaceWatch.available {
+            let s = spaceWatch.current()
+            if s != lastSpace {
+                lastSpace = s
+                spaceUntil = now.addingTimeInterval(config.spaceSettle)
+            }
+        }
+        let transition = gesture || now < spaceUntil
+        let chordHeld = chordState.held
+        let t = now.timeIntervalSinceReferenceDate
+
+        for c in controllers.values {
+            let usable = screenIsUsable(c.display)
+            await c.tick(now: t, dt: realDt, active: enabled && !paused && usable,
+                         transition: transition, chordHeld: chordHeld)
+        }
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Состояние сессии: не работаем на спящем/заблокированном экране
@@ -1672,6 +2143,10 @@ func screenIsUsable(_ display: CGDirectDisplayID) -> Bool {
     return true
 }
 
+/// Яркость, которую считаем погашенным экраном: нижнее нажатие клавиш
+/// выключает подсветку, и DisplayServices читает ровно 0.
+let screenOffLevel = 0.001
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Основной цикл
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1680,6 +2155,16 @@ func screenIsUsable(_ display: CGDirectDisplayID) -> Bool {
 func runDaemon(dryRun: Bool, singleShot: Bool) async {
     ensureDirs()
     let config = Config.load()
+
+    let keyTap = BrightnessKeyTap()
+    if config.externalDisplays && !dryRun && !singleShot {
+        if !keyTap.isTrusted {
+            log("перехват клавиш яркости требует разрешения Accessibility — запрашиваю")
+            keyTap.requestPermission()
+        }
+        keyTap.ensureRunning()
+        Task { @MainActor in await runExternals(config, keyTap: keyTap) }
+    }
 
     // Крышка закрыта — управлять нечем. Ждём молча, а не выходим: выход
     // по KeepAlive превратился бы в перезапуск раз в несколько секунд.
@@ -1834,7 +2319,6 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     let boost = XDRBoost(display: display)
     keyTrace.enabled = config.traceKeys || config.traceEvents
     eventTrace.set(config.traceEvents)
-    let keyTap = BrightnessKeyTap()
     if config.nativeKeysBoost && config.maxBoost > 1.0 {
         if !keyTap.isTrusted {
             log("перехват клавиш яркости требует разрешения Accessibility — запрашиваю")
@@ -1967,49 +2451,48 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     /// «почти 60, демон чуть подвинет». На краю шкалы это почти тождество, к
     /// середине пересчёт усиливается — потому середина в точки и не пишется.
     func calibrate(_ value: Double) {
+        // Ноль — это не «очень тускло», а «экран погашен». В точку его класть
+        // нельзя: граница minBrightness подняла бы его до 15%, и демон тут же
+        // зажёг бы экран обратно, а светлая точка уехала бы следом за тёмной.
+        // Держим погашенным, пока человек сам не поднимет яркость.
+        if value <= screenOffLevel {
+            holding = true
+            state.holdLuma = smoothedLuma
+            log("экран погашен руками — точки не трогаю, не зажгу, пока не поднимешь яркость сам")
+            state.save()
+            liveState.set(state)
+            return
+        }
         let n = normalizedLuma(smoothedLuma, config)
         let waited = Date().timeIntervalSince(pendingManualAt)
         let delay = (config.traceEvents || config.traceKeys) && waited < 60
             ? String(format: "  [ждал зоны %.2fс]", waited) : ""
-        let lo = max(0, min(0.5, config.calibrateEdge))
-        let clampPoint = { (x: Double) in max(config.minBrightness, min(config.maxBrightness, x)) }
-
-        if n <= lo {
-            // value = dark^(1−n) · light^n  ⇒  dark = (value / light^n)^(1/(1−n))
-            let light = max(1e-4, state.light)
-            state.dark = clampPoint(pow(value / pow(light, n), 1 / max(1e-6, 1 - n)))
-            // Край зоны — это всё ещё экстраполяция: при n близком к lo
-            // показатель 1/(1−n) разгоняет правку, и при близких концах одного
-            // нажатия «тусклее» хватает, чтобы тёмный конец ушёл под светлый.
-            // Пересечение не подрезаем: выставленное рукой значение важнее сохранённого
-            // соседа — иначе демон отыграл бы нажатие назад. Сосед идёт следом,
-            // кривая становится плоской — до первой же правки на светлом экране.
-            let crossed = state.dark < state.light
+        let c = calibratePoints(value: value, n: n, dark: state.dark, light: state.light,
+                                edge: config.calibrateEdge, min: config.minBrightness, max: config.maxBrightness)
+        switch c.zone {
+        case .dark:
             let wasLight = state.light
-            if crossed { state.light = state.dark }
+            state.dark = c.dark
+            state.light = c.light
             holding = false
             state.holdLuma = nil
-            let tail = crossed
+            let tail = c.crossed
                 ? String(format: "светлый был выше (%@) — подтянул туда же, кривая пока плоская", pct(wasLight))
                 : String(format: "светлый остаётся %@", pct(state.light))
             log(String(format: "тёмный экран → %@ (светлота %.3f, norm %.2f); %@%@",
                        pct(state.dark), smoothedLuma, n, tail, delay))
-        } else if n >= 1 - lo {
-            let dark = max(1e-4, state.dark)
-            state.light = clampPoint(pow(value / pow(dark, 1 - n), 1 / max(1e-6, n)))
-            // Симметрично тёмной зоне: светлый конец не перепрыгивает тёмный,
-            // а тащит его за собой.
-            let crossed = state.light > state.dark
+        case .light:
             let wasDark = state.dark
-            if crossed { state.dark = state.light }
+            state.dark = c.dark
+            state.light = c.light
             holding = false
             state.holdLuma = nil
-            let tail = crossed
+            let tail = c.crossed
                 ? String(format: "тёмный был ниже (%@) — поднял туда же, кривая пока плоская", pct(wasDark))
                 : String(format: "тёмный остаётся %@", pct(state.dark))
             log(String(format: "светлый экран → %@ (светлота %.3f, norm %.2f); %@%@",
                        pct(state.light), smoothedLuma, n, tail, delay))
-        } else {
+        case .middle:
             // Серединка: ни туда ни сюда. Точки не трогаем — держим выставленное
             // до смены контента, как держали бы любую разовую правку.
             log(String(format: "правка на %@ при светлоте %.3f (norm %.2f) — это середина, точки не трогаю, держу до смены контента%@",
@@ -2609,6 +3092,11 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         // Сравниваем с исходной точкой, а не с прошлым тактом: медленный дрейф
         // контента накапливается и в конце концов порог всё равно перешагнёт.
         if holding {
+            // Погашенный руками экран смена контента не будит.
+            if actual <= screenOffLevel {
+                current = actual
+                continue
+            }
             let drift = abs(normalizedLuma(smoothedLuma, config) - normalizedLuma(holdLuma, config))
             guard drift > config.resumeLumaDelta else {
                 current = actual
@@ -2637,12 +3125,8 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         // Критически демпфированная пружина в устойчивой дискретной форме.
         // Перелёта не даёт по построению, а цель можно менять на каждом такте —
         // поэтому смена контента посреди хода подхватывается без разрыва.
-        let x = omega * dt
-        let decay = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x)
-        let offset = current - target
-        let temp = (velocity + omega * offset) * dt
-        velocity = (velocity - omega * temp) * decay
-        current = target + (offset + temp) * decay
+        (current, velocity) = springStep(current: current, velocity: velocity, target: target,
+                                         omega: omega, dt: dt)
 
         // Упор в потолок или пол гасит скорость, иначе пружина «заводится»
         // на рельсе и потом выстреливает обратно.

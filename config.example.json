@@ -30,6 +30,8 @@
   "wakeSettle": 2.0,
   "maxBoost": 1.6,
   "nativeKeysBoost": true,
+  "externalDisplays": true,
+  "ddcStepInterval": 0.02,
   "chordHold": 0.2,
   "startupGrace": 90,
 

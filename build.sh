@@ -62,8 +62,9 @@ swiftc -O \
     -framework ScreenCaptureKit \
     -framework AppKit \
     -framework MetalKit \
+    -framework IOKit \
     -o "$APP/Contents/MacOS/adaptive-brightness" \
-    "$ROOT/src/main.swift"
+    "$ROOT/src/model.swift" "$ROOT/src/main.swift"
 
 echo "==> Info.plist"
 cat > "$APP/Contents/Info.plist" <<'PLISTEOF'
