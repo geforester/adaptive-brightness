@@ -184,6 +184,11 @@ struct Config {
     /// Dell P2415Q: записи подряд без пауз он тоже принимает без ошибок, но
     /// на глаз приятнее всего 20 мс.
     var ddcStepInterval: Double = 0.02
+    /// Нижняя граница для внешних мониторов. У встроенной панели minBrightness
+    /// бережёт от почти чёрной подсветки, а у монитора ноль по DDC — тусклая,
+    /// но горящая картинка: беречь не от чего, и граница только отыгрывала
+    /// назад правки ниже 15%.
+    var externalMinBrightness: Double = 0
 
     /// Потолок буста на XDR-панели. 1.0 — буст запрещён, 1.6 ≈ «160%».
     /// Выше запаса EDR смысла поднимать нет: значения всё равно обрежутся.
@@ -267,6 +272,7 @@ struct Config {
         c.nativeKeysBoost = (raw["nativeKeysBoost"] as? NSNumber)?.boolValue ?? c.nativeKeysBoost
         c.externalDisplays = (raw["externalDisplays"] as? NSNumber)?.boolValue ?? c.externalDisplays
         c.ddcStepInterval = d("ddcStepInterval", c.ddcStepInterval)
+        c.externalMinBrightness = d("externalMinBrightness", c.externalMinBrightness)
         c.chordHold       = d("chordHold", c.chordHold)
         c.keySettle       = d("keySettle", c.keySettle)
         c.keyStill        = d("keyStill", c.keyStill)
@@ -1903,7 +1909,7 @@ final class ExternalController {
         var p = ExternalParams()
         p.darkPoint = config.darkPoint
         p.lightPoint = config.lightPoint
-        p.minBrightness = config.minBrightness
+        p.minBrightness = config.externalMinBrightness
         p.maxBrightness = config.maxBrightness
         p.travelTime = config.travelTime
         p.tauLuma = config.tauLuma

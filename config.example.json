@@ -32,6 +32,7 @@
   "nativeKeysBoost": true,
   "externalDisplays": true,
   "ddcStepInterval": 0.02,
+  "externalMinBrightness": 0,
   "chordHold": 0.2,
   "startupGrace": 90,
 

@@ -249,6 +249,20 @@ test("жест: правка на светлом под заглушенным �
     check(near(s.m.written, 0.7), "на тёмном окне ведёт к тёмной точке: \(s.m.written)")
 }
 
+test("граница 0: правка ниже 15% остаётся, демон её не отыгрывает") {
+    // 15:17: на Dell опускали до 0–11%, точка вставала на 15%, и яркость
+    // тут же возвращалась к 17%.
+    var p = ExternalParams()
+    p.minBrightness = 0
+    var s = Sim(ExternalModel(params: p, dark: 0.46, light: 0.15, written: 0.17, holdLuma: nil))
+    s.run(3, luma: lightLuma)
+    _ = s.keys(-3)
+    s.clear()
+    s.run(3, luma: lightLuma)
+    check(s.calibrations.count == 1 && s.calibrations[0].0 == .light && near(s.m.light, 0), "светлая точка = 0: \(s.m.light)")
+    check(s.writes.isEmpty && near(s.m.written, 0), "стоит на нуле, не отъезжает: \(s.writes)")
+}
+
 test("без кадров: не ведёт и не выдумывает светлоту") {
     var s = Sim(model(written: 0.4))
     s.run(2, luma: nil)
