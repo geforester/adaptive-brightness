@@ -1391,6 +1391,8 @@ protocol LumaSource: AnyObject {
     var frames: UInt64 { get }
     /// Забирает и очищает последнюю ошибку.
     func takeFailure() -> String?
+    /// Последняя ошибка — отказ TCC. Сбрасывается первым же кадром.
+    var declined: Bool { get }
     func start() async throws
     func stop() async
     /// Временно не снимать кадры, не разбирая машинерию захвата.
@@ -1412,6 +1414,7 @@ final class ShotSampler: LumaSource, @unchecked Sendable {
     private var _lastDelivery = Date.distantPast
     private var _frames: UInt64 = 0
     private var _failure: String?
+    private var _declined = false
 
     private var task: Task<Void, Never>?
     private var _suspended = false
@@ -1444,12 +1447,14 @@ final class ShotSampler: LumaSource, @unchecked Sendable {
         let f = _failure; _failure = nil; return f
     }
 
+    var declined: Bool { lock.lock(); defer { lock.unlock() }; return _declined }
+
     private func publish(_ value: Double) {
-        lock.lock(); _luma = value; _lastDelivery = Date(); _frames &+= 1; lock.unlock()
+        lock.lock(); _luma = value; _lastDelivery = Date(); _frames &+= 1; _declined = false; lock.unlock()
     }
 
-    private func publish(failure: String) {
-        lock.lock(); _failure = failure; lock.unlock()
+    private func publish(failure error: Error) {
+        lock.lock(); _failure = error.localizedDescription; _declined = isCaptureDeclined(error); lock.unlock()
     }
 
     func start() async throws {
@@ -1472,7 +1477,7 @@ final class ShotSampler: LumaSource, @unchecked Sendable {
                     self.publish(try await shooter.luma())
                 } catch {
                     shooter.invalidate()
-                    self.publish(failure: error.localizedDescription)
+                    self.publish(failure: error)
                     return
                 }
             }
@@ -1509,6 +1514,7 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
     private var _lastDelivery = Date.distantPast
     private var _frames: UInt64 = 0
     private var _failure: String?
+    private var _declined = false
 
     private var stream: SCStream?
     private let queue = DispatchQueue(label: "com.geforester.adaptive-brightness.capture",
@@ -1541,6 +1547,8 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
         let f = _failure; _failure = nil; return f
     }
 
+    var declined: Bool { lock.lock(); defer { lock.unlock() }; return _declined }
+
     func start() async throws {
         await stop()
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -1571,7 +1579,7 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
 
     /// Синхронная обёртка: NSLock нельзя брать прямо из async-контекста.
     private func noteStreamStarted() {
-        lock.lock(); _lastDelivery = Date(); _failure = nil; lock.unlock()
+        lock.lock(); _lastDelivery = Date(); _failure = nil; _declined = false; lock.unlock()
     }
 
     /// У потока приостановки нет: его пришлось бы останавливать и поднимать
@@ -1602,7 +1610,7 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        lock.lock(); _failure = error.localizedDescription; lock.unlock()
+        lock.lock(); _failure = error.localizedDescription; _declined = isCaptureDeclined(error); lock.unlock()
     }
 
     /// Та же метрика, что у одноразового сэмплера, но по BGRA-буферу потока.
@@ -1680,6 +1688,17 @@ var logToFile = false
 /// без разрешения вызывает системное окно заново, и перезапуск съёма раз в 5 с
 /// превращался в окно раз в 5 с.
 func screenCaptureAllowed() -> Bool { CGPreflightScreenCaptureAccess() }
+
+/// Отказ TCC от самого ScreenCaptureKit. На macOS 27 он бывает и при выданном
+/// разрешении: preflight отвечает «можно», а съём — «user declined», и каждая
+/// попытка съёма показывает окно. Поэтому preflight здесь не судья.
+func isCaptureDeclined(_ error: Error) -> Bool {
+    let e = error as NSError
+    return e.domain == SCStreamErrorDomain && e.code == SCStreamError.Code.userDeclined.rawValue
+}
+
+/// Сколько молчим после отказа TCC при «выданном» разрешении.
+let declinedBackoff: TimeInterval = 30 * 60
 
 /// Разрешения нет: окно уже было показано, дальше ждём молча. Когда его выдали —
 /// выходим, и KeepAlive поднимает демон заново: процесс, которому отказали,
@@ -2000,7 +2019,8 @@ final class ExternalController {
             let failure = sampler.takeFailure()
             if failure != nil || sampler.silence > 5 {
                 if !captureDown { captureDown = true; say("съём встал (\(failure ?? "кадров нет больше 5с")) — перезапускаю") }
-                if Date().timeIntervalSince(lastRestart) > 5 {
+                // После отказа TCC — не чаще раза в полчаса: каждая попытка — окно.
+                if Date().timeIntervalSince(lastRestart) > (sampler.declined ? declinedBackoff : 5) {
                     lastRestart = Date()
                     try? await sampler.start()
                 }
@@ -2370,6 +2390,8 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
     var captureDown = false
     var lastRestart = Date.distantPast
     var permissionLost = false
+    // Отказ TCC при выданном разрешении: до этого момента съём не трогаем.
+    var declinedUntil = Date.distantPast
     var paused = false
 
     // ── Ручная правка клавишами ──────────────────────────────────────────────
@@ -2553,6 +2575,8 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
         }
         if !screenWasUsable {
             screenWasUsable = true
+            // Пробуждение — повод попробовать съём снова, не дожидаясь паузы.
+            declinedUntil = .distantPast
             wakeSettleUntil = Date().addingTimeInterval(max(0, config.wakeSettle))
             log(String(format: "экран проснулся — не трогаю яркость %.1fс, пока система доводит свой рамп",
                        max(0, config.wakeSettle)))
@@ -2991,6 +3015,19 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                 captureDown = true
                 log("съём встал (\(failure ?? "кадров нет больше 5с")) — перезапускаю")
             }
+            // Отказ TCC при «выданном» разрешении. Перезапуск раз в 5с — это окно
+            // раз в 5с (так было 17.10), поэтому съём глушим и молчим полчаса
+            // или до пробуждения. Окно, если отказ повторится, — не чаще.
+            if failure != nil, sampler.declined, Date() >= declinedUntil, screenCaptureAllowed() {
+                declinedUntil = Date().addingTimeInterval(declinedBackoff)
+                await sampler.stop()
+                log(String(format: "съём отклонён TCC при выданном разрешении — не трогаю %.0f мин " +
+                           "или до пробуждения", declinedBackoff / 60))
+            }
+            if Date() < declinedUntil {
+                halt("съём отклонён")
+                continue
+            }
             if Date().timeIntervalSince(lastRestart) > 5 {
                 lastRestart = Date()
                 if screenCaptureAllowed() {
@@ -2998,7 +3035,15 @@ func runDaemon(dryRun: Bool, singleShot: Bool) async {
                         log("разрешение на запись экрана выдано — перезапускаюсь")
                         exit(0)
                     }
-                    try? await sampler.start()
+                    do { try await sampler.start() } catch {
+                        // Первый снимок ShotSampler бросает, а не публикует:
+                        // отказ отсюда тоже должен уйти в паузу.
+                        if isCaptureDeclined(error) {
+                            declinedUntil = Date().addingTimeInterval(declinedBackoff)
+                            await sampler.stop()
+                            log("съём снова отклонён TCC — молчу ещё \(Int(declinedBackoff / 60)) мин")
+                        }
+                    }
                 } else if !permissionLost {
                     // Окно система уже показала на упавшем съёме. Цикл не
                     // блокируем: клавиши, буст и аккорд должны жить и дальше.
