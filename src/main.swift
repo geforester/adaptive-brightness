@@ -401,6 +401,13 @@ func builtinDisplayID() -> CGDirectDisplayID? {
     return ids.prefix(Int(count)).first { CGDisplayIsBuiltin($0) != 0 }
 }
 
+/// Дисплей для съёма. Ведомого в зеркале ScreenCaptureKit не отдаёт — тогда
+/// снимаем ведущий: картинка на них одна и та же.
+func shareableDisplay(_ content: SCShareableContent, _ id: CGDirectDisplayID) -> SCDisplay? {
+    content.displays.first { $0.displayID == id }
+        ?? content.displays.first { $0.displayID == CGDisplayMirrorsDisplay(id) && $0.displayID != kCGNullDirectDisplay }
+}
+
 func screen(for display: CGDirectDisplayID) -> NSScreen? {
     NSScreen.screens.first {
         ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display
@@ -470,7 +477,7 @@ final class ScreenSampler: @unchecked Sendable {
         // Снимаем ту же панель, чьей подсветкой управляем, а не первую попавшуюся:
         // светлота чужого экрана к этой подсветке отношения не имеет.
         guard let id = self.display ?? builtinDisplayID(),
-              let display = content.displays.first(where: { $0.displayID == id }) else {
+              let display = shareableDisplay(content, id) else {
             throw NSError(domain: "adaptive-brightness", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: self.display == nil
                               ? "встроенного дисплея нет (крышка закрыта?)" : "дисплея \(self.display!) нет"])
@@ -1555,7 +1562,7 @@ final class LiveSampler: NSObject, LumaSource, SCStreamOutput, SCStreamDelegate,
         // Снимаем ту же панель, чьей подсветкой управляем, а не первую попавшуюся:
         // светлота чужого экрана к этой подсветке отношения не имеет.
         guard let id = self.display ?? builtinDisplayID(),
-              let display = content.displays.first(where: { $0.displayID == id }) else {
+              let display = shareableDisplay(content, id) else {
             throw NSError(domain: "adaptive-brightness", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: self.display == nil
                               ? "встроенного дисплея нет (крышка закрыта?)" : "дисплея \(self.display!) нет"])
@@ -2073,6 +2080,7 @@ final class ExternalController {
 func runExternals(_ config: Config, keyTap: BrightnessKeyTap) async {
     var controllers: [CGDirectDisplayID: ExternalController] = [:]
     var unsupported = Set<CGDirectDisplayID>()
+    var mirrored = Set<CGDirectDisplayID>()
     var lastScan = Date.distantPast
     let spaceWatch = SpaceWatch()
     var lastSpace = spaceWatch.current()
@@ -2098,10 +2106,25 @@ func runExternals(_ config: Config, keyTap: BrightnessKeyTap) async {
             var ids = [CGDirectDisplayID](repeating: 0, count: 16)
             var count: UInt32 = 0
             CGGetOnlineDisplayList(UInt32(ids.count), &ids, &count)
-            let online = Set(ids.prefix(Int(count)).filter { CGDisplayIsBuiltin($0) == 0 })
+            let attached = Set(ids.prefix(Int(count)).filter { CGDisplayIsBuiltin($0) == 0 })
+
+            // Зеркало — не наш монитор. Ведомый показывает чужую картинку, а
+            // ведущий, которого зеркалит панель, — это проектор в mirror:
+            // курсор система числит на нём, и клавиши ушли бы ему, а не панели.
+            // Проверяем на каждом опросе: зеркало включают и после подключения.
+            let panel = builtinDisplayID()
+            let nowMirrored = attached.filter { id in
+                CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay
+                    || panel.map { CGDisplayMirrorsDisplay($0) == id } == true
+            }
+            for id in nowMirrored.subtracting(mirrored) where controllers[id] == nil {
+                log("дисплей \(id): зеркало — не управляю, клавиши идут встроенной панели")
+            }
+            mirrored = nowMirrored
+            let online = attached.subtracting(mirrored)
 
             for (id, c) in controllers where !online.contains(id) {
-                log("[\(c.port.name)] отключён")
+                log("[\(c.port.name)] \(mirrored.contains(id) ? "ушёл в зеркало — отпускаю, клавиши идут встроенной панели" : "отключён")")
                 await c.stop()
                 controllers[id] = nil
             }
@@ -2111,12 +2134,11 @@ func runExternals(_ config: Config, keyTap: BrightnessKeyTap) async {
                 let ports = ddcPorts()
                 for id in fresh {
                     let hits = ports.filter { $0.matches(id) }
-                    guard hits.count == 1, CGDisplayMirrorsDisplay(id) == kCGNullDirectDisplay else {
+                    guard hits.count == 1 else {
                         unsupported.insert(id)
                         log(hits.isEmpty
                             ? "дисплей \(id): DDC-порта нет (Apple-дисплей, AirPlay или адаптер без DDC) — не управляю"
-                            : hits.count > 1 ? "дисплей \(id): несколько одинаковых мониторов без серийника — не различаю, не управляю"
-                            : "дисплей \(id): зеркало — не управляю")
+                            : "дисплей \(id): несколько одинаковых мониторов без серийника — не различаю, не управляю")
                         continue
                     }
                     let c = ExternalController(display: id, port: hits[0], config: config)
