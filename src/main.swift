@@ -935,6 +935,11 @@ final class KeyPassState: @unchecked Sendable {
     private var swallowedDownKey = false
     private var externalUpKey = false
     private var externalDownKey = false
+    // Хоть одно нажатие за это удержание ушло системе. Тогда и отпускание её:
+    // автоповтор, начатый ниже 100% и доехавший до буста, иначе оставлял
+    // систему с зажатой клавишей — индикатор яркости висел до перезагрузки.
+    private var passedUpKey = false
+    private var passedDownKey = false
 
     /// Нажатие ушло внешнему монитору — отпускание идёт туда же, а не панели.
     func recordExternal(up: Bool, _ ext: Bool) {
@@ -949,12 +954,25 @@ final class KeyPassState: @unchecked Sendable {
 
     func recordDown(up: Bool, swallowed: Bool) {
         lock.lock(); defer { lock.unlock() }
-        if up { swallowedUpKey = swallowed } else { swallowedDownKey = swallowed }
+        if up {
+            swallowedUpKey = swallowed
+            if !swallowed { passedUpKey = true }
+        } else {
+            swallowedDownKey = swallowed
+            if !swallowed { passedDownKey = true }
+        }
     }
 
+    /// Глотать ли отпускание. Вызывается на отпускании и закрывает удержание.
     func swallowedDown(up: Bool) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return up ? swallowedUpKey : swallowedDownKey
+        if up {
+            defer { passedUpKey = false }
+            return swallowedUpKey && !passedUpKey
+        } else {
+            defer { passedDownKey = false }
+            return swallowedDownKey && !passedDownKey
+        }
     }
 }
 
